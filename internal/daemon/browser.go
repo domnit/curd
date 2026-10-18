@@ -208,6 +208,10 @@ func (d *Daemon) sessionEvent(ev browser.SessionEvent) {
 		if ev.BlockedWrite {
 			rec.Tags = append(rec.Tags, "blocked_write")
 		}
+	case "login_post":
+		// A login form submission let through during the login phase.
+		rec.Event, rec.Method, rec.Host = "login_post", ev.Method, ev.Host
+		_, rec.Path = hostPath(ev.URL)
 	default:
 		return
 	}

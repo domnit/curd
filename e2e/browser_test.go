@@ -366,6 +366,7 @@ allow:
 		if posts() != 1 {
 			t.Fatalf("login POST during the login phase: saw %d", posts())
 		}
+		wantContains(t, "audit", e.curd("audit", "tail", "-n", "50").stdout, "login_post")
 		// Once the login phase ends the session is read-only again.
 		wantContains(t, "login done", e.browse("login", "done").stdout, "login phase: closed")
 		wantCode(t, e.browse("open", e.base()+"/login"), 0)
