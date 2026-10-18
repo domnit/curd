@@ -2,4 +2,10 @@
 // both the CLI and, as `curd daemon`, the long-lived process.
 package main
 
-func main() {}
+import (
+	"os"
+
+	"github.com/domnit/curd/internal/cli"
+)
+
+func main() { os.Exit(cli.Execute()) }

@@ -80,6 +80,9 @@ type FetchResult struct {
 	// NewToken is set when this call ran consent and minted a grant.
 	NewToken string   `json:"new_token,omitempty"`
 	Explain  *Explain `json:"explain,omitempty"`
+	// Granted describes the grant this call used, set only when it ran
+	// consent and minted one (so the client can say what was granted).
+	Granted *GrantInfo `json:"granted,omitempty"`
 }
 
 // Explain is the dry-run report for fetch --explain.

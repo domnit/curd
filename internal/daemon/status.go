@@ -1,0 +1,104 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"time"
+
+	"github.com/domnit/curd/internal/api"
+	"github.com/domnit/curd/internal/apierr"
+	"github.com/domnit/curd/internal/audit"
+	"github.com/domnit/curd/internal/rpc"
+)
+
+// MethodTestConsentFailures is a test-mode-only RPC reporting scripted
+// consent violations (unexpected or mismatched prompts).
+const MethodTestConsentFailures = "test.consent_failures"
+
+// ConsentFailuresResult is the result of MethodTestConsentFailures.
+type ConsentFailuresResult struct {
+	Failures  []string `json:"failures"`
+	Remaining int      `json:"remaining"` // scripted prompts never asked
+}
+
+func (d *Daemon) registerBuiltins() {
+	d.registerFetchHandlers()
+	d.registerGrantHandlers()
+	d.registerPolicyHandlers()
+	d.register(api.MethodStatus, d.handleStatus)
+	d.register(api.MethodAuditTail, d.handleAuditTail)
+	d.register(api.MethodShutdown, d.handleShutdown)
+	d.registerNotAvailable()
+	if d.scripted != nil {
+		d.register(MethodTestConsentFailures, func(context.Context, rpc.Peer, json.RawMessage) (any, error) {
+			f := d.scripted.Failures()
+			if f == nil {
+				f = []string{}
+			}
+			return ConsentFailuresResult{Failures: f, Remaining: d.scripted.Remaining()}, nil
+		})
+	}
+}
+
+// registerNotAvailable installs placeholders for the methods that will be
+// replaced when browser sessions, capture and distill are wired. Register
+// overrides them.
+func (d *Daemon) registerNotAvailable() {
+	na := func(context.Context, rpc.Peer, json.RawMessage) (any, error) {
+		return nil, apierr.New(apierr.NotAvailable, "browser sessions are not wired yet",
+			"use `curd fetch` for brokered requests; browser sessions, capture and distill are coming")
+	}
+	for _, m := range []string{
+		api.MethodOpenSession, api.MethodCloseSession, api.MethodBrowse,
+		api.MethodCaptureList, api.MethodCaptureGet, api.MethodCaptureFind, api.MethodCaptureExport,
+		api.MethodDistillDraft, api.MethodDistillVerify,
+	} {
+		d.register(m, na)
+	}
+}
+
+func (d *Daemon) handleStatus(context.Context, rpc.Peer, json.RawMessage) (any, error) {
+	d.mu.Lock()
+	counter := d.sessionCount
+	started := d.started
+	d.mu.Unlock()
+	sessions := 0
+	if counter != nil {
+		sessions = counter()
+	}
+	d.grants.Sweep()
+	srcs := d.sources.Status()
+	if srcs == nil {
+		srcs = []api.SourceStatus{}
+	}
+	return api.StatusResult{
+		Version: d.cfg.Version, Mode: string(d.cfg.Mode), PID: os.Getpid(), Socket: d.cfg.Paths.Socket,
+		Started: started, Policies: d.policies.current().statuses, Sources: srcs,
+		Grants: d.grants.Len(), Sessions: sessions, Keychain: d.cfg.KeychainMode,
+	}, nil
+}
+
+func (d *Daemon) handleAuditTail(_ context.Context, _ rpc.Peer, raw json.RawMessage) (any, error) {
+	var p api.AuditTailParams
+	if err := rpc.DecodeParams(raw, &p); err != nil {
+		return nil, err
+	}
+	if p.N <= 0 {
+		p.N = 20
+	}
+	recs, err := d.audit.Tail(p.N)
+	if err != nil {
+		return nil, apierr.New(apierr.Internal, err.Error(), "")
+	}
+	return api.AuditTailResult{Records: recs}, nil
+}
+
+func (d *Daemon) handleShutdown(_ context.Context, peer rpc.Peer, _ json.RawMessage) (any, error) {
+	d.writeAudit(audit.Record{Event: "shutdown", ClientPID: peer.PID, ClientExe: peer.Exe, Decision: "allow"})
+	// Let the response reach the client before the connections are closed.
+	d.mu.Lock()
+	d.shutdownTimer = time.AfterFunc(100*time.Millisecond, d.Stop)
+	d.mu.Unlock()
+	return map[string]bool{"ok": true}, nil
+}

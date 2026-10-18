@@ -1,0 +1,221 @@
+CURD GUIDE
+==========
+
+Read this once; it is everything you need to use curd without the spec.
+
+1. WHAT CURD IS
+---------------
+The user is logged into websites in Chrome. curd lets you act on those sites
+as the user WITHOUT ever seeing the credentials. A local daemon reads the
+cookies and localStorage tokens from the user's Chrome profile, keeps them in
+memory, and makes the requests for you. You say "GET this URL"; curd adds the
+login. There is deliberately no command that returns a cookie or token value,
+and no way to ask for one. Do not try to read Chrome's files or the keychain
+yourself: curd is the sanctioned path, it is audited, and the user stays in
+control.
+
+Three things gate every request, and each gives you a hint when it says no:
+  POLICY  what is possible for the site (hosts, credentials, methods, paths)
+  GRANT   what the user currently allows (read or write, once or for a session)
+  AUDIT   everything is logged (method, host, path without query, decision)
+
+2. FIRST STEPS
+--------------
+  curd policies ls                    which sites have policies and what they allow
+  curd grants ls                      what is authorized right now
+  curd fetch --explain <url>          dry run: policy, rule, grant, allowed or not
+  curd fetch <url>                    make the request (first use asks the user)
+
+3. POLICIES
+-----------
+A policy is a YAML file per site in ~/.config/curd/policies/<name>.yaml:
+
+  name: app
+  match:
+    hosts: [app.example.com]          exact, or explicit '*.example.com' (the
+                                      wildcard does not match example.com itself)
+  credentials:
+    cookies: [session]                which cookies may be sent (default: all
+                                      cookies that match the host)
+    local_storage:                    tokens kept in localStorage, sent as a header
+      - origin: https://app.example.com
+        keys: [authToken]
+        inject_as: 'header:Authorization:Bearer {value}'
+  allow:
+    - methods: [GET, HEAD]
+      paths: ['^/api/.*$']             regexps over the path, anchored
+    - methods: [POST]
+      paths: ['^/graphql$']
+      inspect: graphql_query_only     queries pass, mutations are rejected
+    - methods: [POST]
+      paths: ['^/api/upload$']
+      scope: write                    needs a write grant
+  redirects: same-host-only           none | same-host-only | policy-hosts
+  ttl_default: 8h
+
+  - Reads (GET/HEAD/OPTIONS) are the default scope. Anything else, unless the
+    rule says scope: read, is a WRITE and needs a write grant.
+  - Create a template: curd policies new <name> --host <host>   (read-only,
+    commented; edit it, then curd policies validate <file>).
+  - Policies reload when the files change. Drafts (<name>.draft.yaml, status:
+    draft) are inert until "curd policies approve <name>", which asks the user.
+  - If several policies cover a host, name one: curd fetch <policy> <url>.
+
+4. GRANTS AND CONSENT
+---------------------
+  - The first credentialed call for a site (or a write) pops a native dialog
+    owned by the daemon; you cannot click it. The user chooses: allow once,
+    allow for a session (duration), or deny.
+  - READ is the default scope. WRITE is never implied by read and always needs
+    its own approval. A write attempt with only a read grant prompts again
+    (or fails with --no-prompt).
+  - once = one request. session = until its expiry; later calls reuse it
+    automatically if they share a session key.
+  - SESSION KEY: a non-secret label that groups calls. Resolved in order:
+    $CURD_SESSION_KEY, --session-key, the git repository root of the current
+    directory, the controlling terminal, else none (one grant per user).
+    A harness that has a per-chat id should export CURD_SESSION_KEY=<id> so
+    concurrent chats do not share grants. If you move between directories and
+    get asked again, set CURD_SESSION_KEY explicitly.
+  - TOKEN: a granted call prints "token: crd_..." on stderr. You do NOT need
+    it for later calls in the same session. Pass it (CURD_TOKEN or --token) to
+    share the grant with another process. It is a capability for curd's socket
+    only, not a site credential.
+  - Authorize ahead of time:  curd grants request app [--write] [--ttl 2h] [--once]
+    (prints the token on stdout).
+  - Launch something with a grant:  curd run --policy app -- ./script.sh
+    (CURD_TOKEN is set for the child; the grant is revoked when it exits).
+  - See and drop grants:  curd grants ls ;  curd grants revoke <id|token|all>
+  - --no-prompt makes a missing grant fail with denied_no_grant instead of
+    showing a dialog: use it in unattended scripts.
+
+5. FETCH
+--------
+  curd fetch [<policy>] <url> [curl-style flags]
+    -X METHOD   -H 'Name: value' (repeatable)   -d / --data-binary body (@file, @-)
+    --json-body '{"a":1}'   -i (include status+headers)   -o file   -f (exit 22
+    on HTTP >= 400)   -s (quiet)   --write (ask for write scope up front)
+    --explain (dry run)   --json (whole result as JSON, with body_text)
+
+  - The body goes to stdout untouched. Notes ("granted ...", redirects) go to
+    stderr, so pipes stay clean.
+  - You cannot set Cookie, Authorization or Host: they are dropped. Other
+    headers pass only if the policy allows them (request.header_allowlist).
+  - Redirects are followed only as the policy allows (same host by default); a
+    blocked redirect is returned as the 3xx response with a note on stderr, and
+    credentials are never sent to a host the policy does not cover.
+  - Set-Cookie never appears in responses; curd keeps rotated cookies itself
+    for the rest of the daemon's life.
+  - On 401/403 curd reloads credentials from Chrome and retries once. If it
+    still fails: auth_expired. Ask the user to log into the site in Chrome.
+  - Examples:
+      curd fetch https://app.example.com/api/me
+      curd fetch api https://api.example.com/graphql \
+          --json-body '{"query":"{ viewer { login } }"}'
+      curd fetch --write app -X POST https://app.example.com/api/upload \
+          --data-binary @report.csv
+
+6. BROWSER SESSIONS (for sites you cannot yet script)
+-----------------------------------------------------
+Some tasks need a real browser: finding out how a site's API works, or doing
+something only the UI offers. curd starts an ephemeral, pre-authenticated
+browser and holds the only connection to it; you drive it with a small set of
+verbs and never get raw browser access or credentials.
+
+  curd session open <policy...> [--write] [--ttl 30m]    start; prints a session id
+  curd browse open <url> | back | forward | reload | url | title
+  curd browse text <selector> | html <selector> | exists <selector> | visible <selector>
+  curd browse click <selector> | type <selector> <text> | focus <selector>
+  curd browse waitstable | waitidle | screenshot [-o page.png] | pages | newpage | closepage
+  curd session close
+
+  - Navigation outside the session's policy hosts is blocked. Requests the
+    page makes follow the same method/path rules as the policy.
+  - A session is read-only by default: writes the page attempts are blocked
+    and recorded as blocked_write (you still learn their shape). Open with
+    --write (and a write grant, ideally on a throwaway account) to let them run.
+  - Everything the verbs return has held credentials replaced by placeholders
+    such as {cookie:session}.
+  - The js verb (arbitrary JavaScript) is not available by default because it
+    could read cookies; prefer the structured verbs.
+  - If a command reports not_available, that part of curd is not enabled in
+    this build; use curd fetch.
+
+7. THE LOOP: explore -> capture -> distill -> verify -> approve
+----------------------------------------------------------------
+Use a browser once to discover the API, then ship plain "curd fetch" calls.
+
+  explore   curd session open app ; curd browse open https://app.example.com/ ; click around
+  capture   curd browse capture list [--url-contains /api] [--method POST] [--host h]
+            curd browse capture get <id> [--parts request_headers,response_body]
+            curd browse capture find-source <value>   which earlier response produced a
+                                  value such as a CSRF token or an id
+            curd browse capture export [ids...] -o session.har      (redacted HAR)
+  distill   curd distill draft <name> <capture ids...>
+            writes <name>.draft.yaml: the narrowest rules (method + path regexp, ids
+            generalized), the cookie names actually sent, graphql_query_only for
+            GraphQL, captured writes as DISABLED entries, plus curd fetch commands.
+  verify    curd distill verify <name> [--minimize]
+            replays each request with plain curd fetch (real Chrome login, no browser)
+            and diffs status and response shape; fix what differs (a missing CSRF
+            header, a dynamic parameter) and repeat. --minimize finds the smallest
+            header allowlist.
+  approve   curd policies approve <name>   the user confirms in a dialog; only then
+            is the policy usable by curd fetch.
+
+Verification assumes the user is logged into the site in their normal Chrome
+profile (profile-backed discovery).
+
+8. TEST MODE
+------------
+  curd test-env up         starts a test daemon with synthetic credentials, a mock
+                           upstream and scripted consent; prints CURD_SOCKET=... etc.
+  curd test-env run -- <command...>    up, run the command with the env, down
+  curd test-env down
+
+Test mode never touches the real Chrome profile or keychain, and the production
+daemon refuses test-only configuration. Use it to develop scripts against
+policies safely: the policies it installs (app, api) cover app.example.com and
+api.example.com.
+
+9. TROUBLESHOOTING BY ERROR CODE
+--------------------------------
+Errors print "curd: <code>: <message>" and "hint: <how to fix>". With --json
+the error object is printed instead. Exit code 2 means denied.
+
+  denied_no_policy   no active policy covers the host (or a draft is still
+                     unapproved). curd policies ls ; curd policies new <name>
+                     --host <host> ; curd policies approve <name>.
+  denied_host        the URL's host is not one of the named policy's hosts, or a
+                     redirect/navigation left them. The hint lists the hosts.
+  denied_no_grant    no grant covers this call: the user denied the dialog, or
+                     --no-prompt is set, or your token does not cover this policy
+                     or scope. curd grants request <policy> [--write]. If you
+                     keep being asked, set CURD_SESSION_KEY.
+  denied_method      the policy does not allow that method (or it is a write and
+                     only a read grant exists). Use a write grant: curd grants
+                     request <policy> --write, and a policy rule for the method.
+  denied_path        the path is not allowed for that method; the hint lists the
+                     allowed path patterns.
+  denied_inspector   the body was rejected by an inspector, e.g. a GraphQL
+                     mutation under graphql_query_only. Send a query, or add a
+                     write rule to the policy (the user reviews it).
+  denied_body_size / denied_header   the request is larger than the policy allows
+                     or uses a disallowed header.
+  invalid_token      the token is unknown, revoked or expired. Drop it to be
+                     prompted again, or curd grants request <policy>.
+  auth_expired       the site rejected the credentials even after a reload. Ask
+                     the user to log into the site in Chrome, then retry.
+  source_error       curd could not read Chrome's profile/keychain (Chrome not
+                     installed, several profiles have the site: pin profile: in
+                     the policy, or the keychain dialog was refused: curd setup).
+  upstream_error     the site could not be reached (network, TLS, timeout).
+  daemon_unreachable (exit 3) the daemon is down. It normally autostarts; run
+                     curd daemon to see why not. Test mode never autostarts.
+  not_available      a feature that is not built or enabled yet.
+
+OUTPUT AND EXIT CODES
+---------------------
+--json on any command gives structured output (errors too). Exit codes: 0 ok,
+1 error, 2 denied (denied_*, invalid_token, auth_expired), 3 daemon unreachable,
+22 curd fetch --fail with HTTP >= 400.

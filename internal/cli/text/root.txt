@@ -1,0 +1,64 @@
+curd (Cookie Ushering Retrieval Daemon) lets scripts and agents use the logins
+the user already has in Chrome, without ever handling the credentials.
+
+A local daemon reads cookies and localStorage tokens from the user's Chrome
+profile, keeps them in memory, and makes requests on your behalf: you name a
+URL, curd adds the credentials server-side. No command returns a cookie or
+token value, and there is no way to ask for one. Run "curd guide" for the full
+mental model.
+
+HOW IT WORKS (the flow)
+
+  1. A policy says what is possible for a site: which hosts, which cookies or
+     tokens, which methods and paths. Policies are YAML files; list them with
+     "curd policies ls". Reads are the default, writes are opt-in per rule.
+     Create one with "curd policies new <name> --host <host>".
+  2. The first time you use a site, the user sees a native consent dialog and
+     approves a grant. Grants are read-only by default; a write grant is a
+     separate, explicit consent. A grant lasts once, or for a session, and is
+     shared by later calls in the same session (same git repo or terminal,
+     or the same --session-key / CURD_SESSION_KEY). You do not need a token.
+  3. "curd fetch" sends the request through the daemon, which checks method,
+     path and request body against the policy, injects the credentials,
+     follows redirects only as the policy allows, and returns the response
+     with Set-Cookie stripped. Every request is audited.
+  4. Every denial says what to do next ("hint:"): which command requests a
+     grant, which paths are allowed, whether the user must log in to the site
+     in Chrome. Read the hint before retrying.
+
+QUICK START
+
+  curd policies ls                               what is allowed, per site
+  curd fetch https://app.example.com/api/me      first use asks the user
+  curd fetch --explain https://app.example.com/api/me     dry run, sends nothing
+  curd fetch app https://app.example.com/api/items -H 'Accept: application/json'
+  curd fetch --write app https://app.example.com/api/upload --data-binary @f.png
+  curd grants ls                                 what is currently authorized
+  curd grants revoke all                         drop every grant now
+
+EXPLORING A SITE YOU HAVE NO POLICY FOR
+
+  When you do not know a site's API, use a browser session instead of
+  guessing: explore -> capture -> distill -> verify -> approve.
+
+  explore   "curd session open <policy>" starts an ephemeral, pre-authenticated
+            browser; drive it with "curd browse open|click|type|text|...".
+  capture   curd records the network traffic with credentials replaced by
+            placeholders; read it with "curd browse capture list|get|find-source".
+  distill   "curd distill draft <name> <capture ids...>" writes a draft policy
+            (status: draft, inert) and matching curd fetch commands.
+  verify    "curd distill verify <name>" replays each request through plain
+            "curd fetch" using the real login, then fix what differs.
+  approve   the user confirms the draft in a dialog: "curd policies approve".
+            Only then does the policy become usable.
+
+EXIT CODES
+
+  0 ok   1 error   2 denied (denied_*, invalid_token, auth_expired)
+  3 daemon unreachable   22 "curd fetch --fail" saw an HTTP status >= 400
+
+TESTING
+
+  "curd test-env up" starts a daemon with synthetic credentials, a mock
+  upstream and scripted consent (no real profile, no keychain, no dialogs):
+  see "curd test-env --help".
