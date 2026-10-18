@@ -103,7 +103,7 @@ The daemon ships as its own signed binary, not a script run by an interpreter. T
 - **Why it matters.** Keychain ACLs on legacy items, including Chrome's `Safe Storage` entry, are tied to the code identity of the requesting app. For a script, that identity is the interpreter, so every script run by it inherits the access. For a signed binary, only the daemon has it; any other process still triggers a prompt.
 - **Modes.** `prompt` (default): the user answers the keychain dialog each time the daemon starts. `always-allow`: the user adds the daemon to the item's ACL once and the key is fetched silently. `strict`: the key is never cached; it is fetched for each reload and discarded after decrypting.
 - **Consent moves into the daemon.** With always-allow the keychain no longer gates anything, so the native grant dialogs (section 10) are the only consent step. Recommended setup: `always-allow` with on-demand key fetch, so no long-lived key sits in memory.
-- **Signing requirements.** Use a stable signing identity (Developer ID, or a local code-signing certificate; verify the latter works). Ad-hoc signatures change with every build and break the ACL. Enable the hardened runtime, do not add the `get-task-allow` entitlement, and never load user-writable code at runtime, so other same-user processes cannot inject into the daemon or attach a debugger to inherit its access.
+- **Signing requirements.** Use a stable signing identity (Developer ID, or a local code-signing certificate; a self-signed local certificate was verified to keep the ACL across rebuilds, 2026-10-18). Ad-hoc signatures change with every build and break the ACL. Enable the hardened runtime, do not add the `get-task-allow` entitlement, and never load user-writable code at runtime, so other same-user processes cannot inject into the daemon or attach a debugger to inherit its access.
 - **Setup.** `curd setup` triggers a one-time keychain dialog to add the binary to Chrome's `Safe Storage` item. The daemon works without it, with one prompt per start.
 - **Limits.** This does not protect localStorage, which is plain on disk, and does not stop same-user processes from connecting to the socket. Where possible, check the connecting client's code signature; scripts under a shared interpreter will all look identical.
 
@@ -255,7 +255,7 @@ For each `fetch` call:
 
 **Keychain.** Production sessions do not pass `--use-mock-keychain`. It makes the profile's encryption key a fixed, publicly known value, so anything persisted there would be readable by any process that can read the directory. Instead, credentials never reach disk: they are seeded only into the off-the-record context described in 9.2. The mock keychain is for test mode only (section 15.1).
 
-To verify: whether Chrome still touches the real `Safe Storage` item when it launches with a temp profile and no persisted cookies. If it does, the options are to accept the prompt, or to fall back to the mock keychain, which is acceptable only because nothing sensitive is ever stored in that profile. Section 9.4 adds a check for that guarantee.
+**Verified** (Chrome 155, macOS, 2026-10-18): it does not; no keychain prompt appears for a temp profile without `--use-mock-keychain`. Original question: whether Chrome still touches the real `Safe Storage` item when it launches with a temp profile and no persisted cookies. If it does, the options are to accept the prompt, or to fall back to the mock keychain, which is acceptable only because nothing sensitive is ever stored in that profile. Section 9.4 adds a check for that guarantee.
 
 ### 9.2 Seeding
 
@@ -353,7 +353,7 @@ Chromium has a switch, `--use-mock-keychain`, that makes Chrome on macOS derive 
 
 - **Chrome-made fixture profile.** Launch Chrome with a temp `--user-data-dir` and `--use-mock-keychain`, seed synthetic cookies and localStorage via CDP, then quit. The result is a real Chrome profile that exercises the real SQLite and LevelDB parsing.
 - **Key provider interface.** `keychain` (real), `mock` (Chrome's fixed test password), `static` (key from test config, for hand-built fixtures).
-- **To verify.** The exact mock password in current Chromium (older source hard-coded `mock_password`; newer source routes through a mock keychain class), and that release Chrome honors the switch, not only test builds. Pin both with a test that makes a fixture using the installed Chrome and decrypts it.
+- **Verified** (Chrome 155.0.8059.82, macOS, 2026-10-18): release Chrome honors `--use-mock-keychain` and the mock password is `mock_password`; pinned by `internal/fixture`'s Chrome-made-profile test. Original note: the exact mock password in current Chromium (older source hard-coded `mock_password`; newer source routes through a mock keychain class), and that release Chrome honors the switch, not only test builds. Pin both with a test that makes a fixture using the installed Chrome and decrypts it.
 
 The mock keychain is for test mode and fixture creation only. Production browser sessions never use it (section 9.1).
 
