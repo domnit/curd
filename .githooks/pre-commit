@@ -1,0 +1,14 @@
+#!/bin/sh
+# curd pre-commit: formatting, vet, both target platforms build, fast tests.
+# Install with: git config core.hooksPath .githooks   (or: make hooks)
+set -e
+unformatted=$(gofmt -l $(git ls-files '*.go') 2>/dev/null || true)
+if [ -n "$unformatted" ]; then
+  echo "pre-commit: gofmt needed on:" >&2
+  echo "$unformatted" >&2
+  exit 1
+fi
+go vet ./...
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build ./...
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet ./...
+go test -short -count=1 ./...
