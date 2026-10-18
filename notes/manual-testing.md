@@ -74,7 +74,11 @@ bin/curd test-env run -- sh -c '
       caution icon and the method/path/body size.
 - [ ] Unanswered dialog gives up after 5 minutes → deny.
 - [ ] Quotes/newlines in a session key (`--session-key 'a"b'`) render as text.
-- [ ] `curd policies approve <draft>` shows the approve dialog.
+- [ ] `curd policies approve <draft>` shows the approve dialog, listing
+      hosts, rules, cookie names (or "ALL cookies"), localStorage keys,
+      redirects mode and header allowlist, with "(+N more)" when long.
+- [ ] `curd daemon stop` shows a "Stop the curd daemon?" dialog; Cancel
+      leaves it running (exit 2).
 
 ## 4. Real site fetch (spec 17 build order: "one authenticated curd fetch end to end")
 
@@ -105,7 +109,14 @@ curd fetch mysite https://app.mysite.com/api/whoami
       `--use-mock-keychain` — does Chrome touch the real "Chrome Safe
       Storage" item (keychain prompt)? Record the answer in the spec.
 - [ ] `curd session open mysite --login`: log in by hand in the window;
-      `curd browse text body` output has no session cookie values.
+      `curd browse text body` output has no session cookie values, and
+      `curd browse capture list`/`get` show no login form body. The login
+      phase ends by itself once the site sets its session cookie
+      (`curd browse login`); check multi-step logins (username, then
+      password page) still complete.
+- [ ] A read-only session on a site that uses WebSockets: the page's socket
+      is refused (blocked entry `websocket_not_granted`) and the UI degrades
+      rather than breaking navigation.
 - [ ] Navigation to an unrelated site is blocked; a write in the UI fails with
       the session read-only and shows as `blocked_write` in
       `curd browse capture list`.
