@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -67,5 +68,50 @@ func TestChromeSourceFixture(t *testing.T) {
 	}
 	if _, err := src.Load(context.Background(), creds.Request{Hosts: []string{"app.example.com"}, Profile: "Nope"}); err == nil || !strings.Contains(err.Error(), "Default") {
 		t.Fatalf("pinned missing profile: %v", err)
+	}
+}
+
+func TestRealProfileRefusal(t *testing.T) {
+	home := t.TempDir()
+	for _, root := range realProfileRoots(home) {
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if !isRealProfileDirIn(root, home, "linux") || !isRealProfileDirIn(filepath.Join(root, "Default"), home, "linux") {
+			t.Errorf("real browser root %s not refused", root)
+		}
+	}
+	// Every known browser, by name.
+	for _, rel := range []string{
+		"Library/Application Support/Google/Chrome Beta", "Library/Application Support/Google/Chrome Canary",
+		"Library/Application Support/Google/Chrome Dev", "Library/Application Support/Chromium",
+		"Library/Application Support/BraveSoftware/Brave-Browser", "Library/Application Support/Microsoft Edge",
+		"Library/Application Support/Vivaldi", ".config/chromium", ".config/BraveSoftware/Brave-Browser",
+		".config/microsoft-edge", ".config/vivaldi", ".config/google-chrome-beta",
+	} {
+		if !isRealProfileDirIn(filepath.Join(home, rel, "Profile 1"), home, "linux") {
+			t.Errorf("%s not refused", rel)
+		}
+	}
+	// A symlink into a real profile is refused.
+	outside := t.TempDir()
+	link := filepath.Join(outside, "innocent")
+	if err := os.Symlink(filepath.Join(home, ".config", "google-chrome"), link); err != nil {
+		t.Fatal(err)
+	}
+	if !isRealProfileDirIn(link, home, "linux") || !isRealProfileDirIn(filepath.Join(link, "Default"), home, "linux") {
+		t.Error("symlink into the real profile accepted")
+	}
+	// Case differences count on darwin only.
+	up := filepath.Join(home, "LIBRARY", "APPLICATION SUPPORT", "GOOGLE", "CHROME")
+	if !isRealProfileDirIn(up, home, "darwin") {
+		t.Error("case-variant real profile accepted on darwin")
+	}
+	if isRealProfileDirIn(up, home, "linux") {
+		t.Error("case folding applied on linux")
+	}
+	// A fixture directory elsewhere is fine, existing or not.
+	if isRealProfileDirIn(t.TempDir(), home, "linux") || isRealProfileDirIn(filepath.Join(t.TempDir(), "new", "profile"), home, "darwin") {
+		t.Error("fixture directory refused")
 	}
 }

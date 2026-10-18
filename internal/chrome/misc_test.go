@@ -24,6 +24,32 @@ func TestFindBinaryEnv(t *testing.T) {
 	}
 }
 
+func TestFindBinaryProdIgnoresEnv(t *testing.T) {
+	dir := t.TempDir()
+	evil := filepath.Join(dir, "evil")
+	os.WriteFile(evil, []byte("#!/bin/sh\n"), 0o755)
+	t.Setenv(config.EnvChrome, evil)
+	got, err := FindBinaryFor(false, "")
+	if got == evil {
+		t.Fatalf("production lookup honored $%s", config.EnvChrome)
+	}
+	_ = err // may legitimately be ErrNoBinary on a machine without Chrome
+	if got, err := FindBinaryFor(true, ""); err != nil || got != evil {
+		t.Fatalf("test lookup: %q, %v", got, err)
+	}
+	// An explicit config path is honored in production; relative paths and
+	// missing files are not.
+	if got, err := FindBinaryFor(false, evil); err != nil || got != evil {
+		t.Fatalf("configured: %q, %v", got, err)
+	}
+	if _, err := FindBinaryFor(false, "evil"); err == nil {
+		t.Fatal("relative chrome_binary accepted")
+	}
+	if _, err := FindBinaryFor(false, filepath.Join(dir, "missing")); err == nil {
+		t.Fatal("missing chrome_binary accepted")
+	}
+}
+
 func TestProfiles(t *testing.T) {
 	root := t.TempDir()
 	mk := func(p string) {

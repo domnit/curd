@@ -47,6 +47,12 @@ type Session struct {
 	// inLoginPhase); zero when there is none.
 	loginUntil time.Time
 	lsScript   string
+	// loginBase is the set of cookies present when the login page loaded;
+	// a cookie outside it ends the login phase (nil until taken).
+	loginBase map[string]bool
+	// domainCookies lists the domains of seeded domain cookies (lowercase,
+	// no leading dot): non-policy hosts under them are never contacted.
+	domainCookies []string
 
 	verbMu sync.Mutex
 
@@ -238,7 +244,7 @@ func (s *Session) start(ctx context.Context) error {
 		ExtraArgs:    args,
 	})
 	if err != nil {
-		return apierr.Newf(apierr.BrowserError, "install Chrome or set CURD_CHROME", "launch browser: %v", err)
+		return apierr.Newf(apierr.BrowserError, "install Google Chrome, or set chrome_binary: in ~/.config/curd/config.yaml (CURD_CHROME works in test mode only)", "launch browser: %v", err)
 	}
 	s.br, s.conn = br, br.Conn
 
@@ -281,9 +287,9 @@ func (s *Session) start(ctx context.Context) error {
 		if err := s.navigate(ctx, pg, s.startURL); err != nil {
 			return err
 		}
-		s.refreshRedactor(ctx)
-		go s.refreshLoop()
 	}
+	s.refreshRedactor(ctx) // login mode: also takes the baseline cookie set
+	go s.refreshLoop()
 	return nil
 }
 
@@ -389,7 +395,7 @@ func (s *Session) onEvent(ev cdp.Event) {
 	switch {
 	case strings.HasPrefix(ev.Method, "Network."):
 		if s.rec != nil {
-			s.rec.HandleEvent(ev.SessionID, ev)
+			s.rec.HandleEvent(ev.SessionID, s.scrubForRecorder(ev))
 		}
 		s.trackNetwork(ev)
 	case ev.Method == "Fetch.requestPaused":
@@ -406,6 +412,41 @@ func (s *Session) onEvent(ev cdp.Event) {
 	case strings.HasPrefix(ev.Method, "Page."):
 		s.onPageEvent(ev)
 	}
+}
+
+// scrubForRecorder removes the request body from the requestWillBeSent event
+// of a Document POST in a login-seeded session before the recorder sees it:
+// that body is a login form (it carries the typed password) and must never
+// reach the capture API.
+func (s *Session) scrubForRecorder(ev cdp.Event) cdp.Event {
+	if s.Seed != SeedLogin || ev.Method != "Network.requestWillBeSent" {
+		return ev
+	}
+	var top map[string]json.RawMessage
+	if json.Unmarshal(ev.Params, &top) != nil {
+		return ev
+	}
+	var typ string
+	_ = json.Unmarshal(top["type"], &typ)
+	var req map[string]json.RawMessage
+	if typ != "Document" || json.Unmarshal(top["request"], &req) != nil {
+		return ev
+	}
+	var method string
+	_ = json.Unmarshal(req["method"], &method)
+	if !strings.EqualFold(method, "POST") {
+		return ev
+	}
+	delete(req, "postData")
+	delete(req, "postDataEntries")
+	req["hasPostData"] = json.RawMessage("false")
+	top["request"], _ = json.Marshal(req)
+	b, err := json.Marshal(top)
+	if err != nil {
+		return ev
+	}
+	ev.Params = b
+	return ev
 }
 
 func (s *Session) trackNetwork(ev cdp.Event) {
@@ -568,6 +609,11 @@ func (s *Session) setupTarget(t *target, waiting bool) {
 		{"Network.enable", nil, true},
 		{"Fetch.enable", map[string]any{"patterns": []map[string]any{{"urlPattern": "*", "requestStage": "Request"}}}, true},
 	}
+	guard := s.wsGuard()
+	if guard != "" && !pageLike {
+		// Workers (before they run): Runtime.evaluate on a paused worker.
+		cmds = append(cmds, cmd{"Runtime.evaluate", map[string]any{"expression": guard}, t.typ == "worker" || t.typ == "shared_worker"})
+	}
 	if pageLike {
 		cmds = append(cmds,
 			cmd{"Page.enable", nil, true},
@@ -575,6 +621,9 @@ func (s *Session) setupTarget(t *target, waiting bool) {
 			cmd{"Network.setBypassServiceWorker", map[string]any{"bypass": true}, false},
 			cmd{"Emulation.setFocusEmulationEnabled", map[string]any{"enabled": true}, false},
 		)
+		if guard != "" {
+			cmds = append(cmds, cmd{"Page.addScriptToEvaluateOnNewDocument", map[string]any{"source": guard}, true})
+		}
 		if s.lsScript != "" {
 			cmds = append(cmds, cmd{"Page.addScriptToEvaluateOnNewDocument", map[string]any{"source": s.lsScript}, true})
 		}

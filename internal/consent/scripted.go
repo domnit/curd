@@ -65,7 +65,7 @@ func NewScripted(spec string) (*Scripted, error) {
 				return nil, fmt.Errorf("consent script %s: prompt %d: invalid answer %q (want once, session, deny or approve)", path, i+1, sp.Answer)
 			}
 			switch Kind(sp.Expect.Kind) {
-			case "", KindGrant, KindApprovePolicy:
+			case "", KindGrant, KindApprovePolicy, KindShutdown:
 			default:
 				return nil, fmt.Errorf("consent script %s: prompt %d: invalid kind %q", path, i+1, sp.Expect.Kind)
 			}
@@ -82,7 +82,7 @@ func (s *Scripted) Ask(_ context.Context, p Prompt) (Answer, error) {
 	defer s.mu.Unlock()
 	switch s.mode {
 	case "allow-all":
-		if p.Kind == KindApprovePolicy {
+		if p.Kind == KindApprovePolicy || p.Kind == KindShutdown {
 			return Approve, nil
 		}
 		return Session, nil

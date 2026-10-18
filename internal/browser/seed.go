@@ -15,6 +15,7 @@ import (
 	"github.com/domnit/curd/internal/apierr"
 	"github.com/domnit/curd/internal/chrome"
 	"github.com/domnit/curd/internal/creds"
+	"github.com/domnit/curd/internal/policy"
 	"github.com/domnit/curd/internal/redact"
 )
 
@@ -30,8 +31,9 @@ type cdpCookie struct {
 	Expires  *float64 `json:"expires,omitempty"`
 }
 
-func toCDPCookie(c creds.Cookie, allowHTTP bool) cdpCookie {
-	host := strings.TrimPrefix(c.Domain, ".")
+// toCDPCookie converts a credential cookie. host is the host the cookie URL
+// points at; domain is the Domain attribute to set ("" = host-only cookie).
+func toCDPCookie(c creds.Cookie, host, domain string, allowHTTP bool) cdpCookie {
 	scheme := "https"
 	if !c.Secure && allowHTTP {
 		scheme = "http"
@@ -45,9 +47,7 @@ func toCDPCookie(c creds.Cookie, allowHTTP bool) cdpCookie {
 		Secure: c.Secure, HTTPOnly: c.HTTPOnly,
 		URL: scheme + "://" + host + path,
 	}
-	if !c.HostOnly() {
-		out.Domain = c.Domain
-	}
+	out.Domain = domain
 	switch strings.ToLower(c.SameSite) {
 	case "lax":
 		out.SameSite = "Lax"
@@ -69,6 +69,7 @@ func toCDPCookie(c creds.Cookie, allowHTTP bool) cdpCookie {
 func (s *Session) seedHoist(ctx context.Context) error {
 	var cookies []cdpCookie
 	var items [][3]string
+	seen := map[string]bool{}
 	for _, p := range s.spec.Policies {
 		c, err := s.opts.Load(ctx, p)
 		if err != nil {
@@ -86,7 +87,7 @@ func (s *Session) seedHoist(ctx context.Context) error {
 			if !creds.CookieDomainRelevant(p.Match.Hosts, ck.Domain) || !p.CookieNameAllowed(ck.Name) {
 				continue
 			}
-			cookies = append(cookies, toCDPCookie(ck, s.opts.Test))
+			cookies = append(cookies, s.scopeCookie(p, ck, seen)...)
 		}
 		for _, it := range c.LocalStorage {
 			ou, err := url.Parse(it.Origin)
@@ -120,6 +121,75 @@ func (s *Session) seedHoist(ctx context.Context) error {
 	return nil
 }
 
+// scopeCookie turns one credential cookie into the cookies to seed so that it
+// reaches only the hosts the policy covers. A host-only cookie is seeded as
+// is. A domain cookie is NOT seeded as a domain cookie (Chrome would send
+// `.example.com` to every sibling host such as cdn.example.com): for each
+// exact policy host it applies to a host-only copy is seeded instead; for a
+// wildcard policy host a domain cookie is kept only when its domain lies
+// within the wildcard's suffix (a wider parent domain is narrowed to the
+// suffix), and the interceptor refuses non-policy hosts such a cookie
+// would reach (domainCookieMatches).
+func (s *Session) scopeCookie(p *policy.Policy, ck creds.Cookie, seen map[string]bool) []cdpCookie {
+	var out []cdpCookie
+	add := func(host, domain string) {
+		key := ck.Name + "|" + host + "|" + domain + "|" + ck.Path
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, toCDPCookie(ck, host, domain, s.opts.Test))
+	}
+	if ck.HostOnly() {
+		add(strings.TrimPrefix(ck.Domain, "."), "")
+		return out
+	}
+	bare := strings.ToLower(strings.TrimPrefix(ck.Domain, "."))
+	for _, pat := range p.Match.Hosts {
+		pat = strings.ToLower(pat)
+		if suffix, ok := strings.CutPrefix(pat, "*."); ok {
+			switch {
+			case bare == suffix || strings.HasSuffix(bare, "."+suffix):
+				add(bare, "."+bare)
+				s.noteDomainCookie(bare)
+			case strings.HasSuffix(suffix, "."+bare):
+				add(suffix, "."+suffix) // narrowed: never wider than the policy
+				s.noteDomainCookie(suffix)
+			}
+			continue
+		}
+		if pat == bare || strings.HasSuffix(pat, "."+bare) {
+			add(pat, "") // host-only copy for exactly this policy host
+		}
+	}
+	return out
+}
+
+func (s *Session) noteDomainCookie(bare string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, d := range s.domainCookies {
+		if d == bare {
+			return
+		}
+	}
+	s.domainCookies = append(s.domainCookies, bare)
+}
+
+// domainCookieMatches reports whether a seeded domain cookie would be sent to
+// host.
+func (s *Session) domainCookieMatches(host string) bool {
+	host = strings.ToLower(host)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, d := range s.domainCookies {
+		if host == d || strings.HasSuffix(host, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
 // lsSeedScript runs in the main world before page scripts. Values are
 // embedded as JSON; they only ever land in localStorage of the matching
 // origin, and only if the key is absent.
@@ -145,17 +215,22 @@ func (s *Session) addSecrets(secrets ...redact.Secret) {
 	s.mu.Unlock()
 }
 
-// refreshRedactor registers the context's current cookie values (login mode,
-// where the daemon does not hold the credentials). The values are used only
-// to redact output and never leave this package.
+// refreshRedactor registers the context's current cookie values: in login
+// mode the daemon does not hold the credentials, and in hoist mode the server
+// may rotate or set cookies. The values are used only to redact output and
+// never leave this package. In login mode it also ends the login phase once
+// the context gains a cookie for a policy host that the login page did not
+// already have.
 func (s *Session) refreshRedactor(ctx context.Context) {
-	if s.spec.Seed != SeedLogin || s.isClosed() {
+	if s.isClosed() {
 		return
 	}
 	var res struct {
 		Cookies []struct {
-			Name  string `json:"name"`
-			Value string `json:"value"`
+			Name   string `json:"name"`
+			Value  string `json:"value"`
+			Domain string `json:"domain"`
+			Path   string `json:"path"`
 		} `json:"cookies"`
 	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -164,10 +239,30 @@ func (s *Session) refreshRedactor(ctx context.Context) {
 		return
 	}
 	secs := make([]redact.Secret, 0, len(res.Cookies))
+	ended := false
+	s.mu.Lock()
+	first := s.loginBase == nil
+	if first {
+		s.loginBase = map[string]bool{}
+	}
 	for _, c := range res.Cookies {
 		secs = append(secs, redact.Secret{Value: c.Value, Placeholder: redact.CookiePlaceholder(c.Name)})
+		k := c.Domain + "|" + c.Path + "|" + c.Name
+		if s.loginBase[k] {
+			continue
+		}
+		s.loginBase[k] = true
+		if !first && s.Seed == SeedLogin && !s.loginUntil.IsZero() &&
+			creds.CookieDomainRelevant(s.PolicyHosts(), c.Domain) {
+			s.loginUntil = time.Time{}
+			ended = true
+		}
 	}
+	s.mu.Unlock()
 	s.addSecrets(secs...)
+	if ended {
+		s.emit(SessionEvent{Type: "login_end", Reason: "session cookie minted"})
+	}
 }
 
 func (s *Session) refreshLoop() {

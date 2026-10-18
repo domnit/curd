@@ -17,6 +17,9 @@ const (
 	KindGrant Kind = "grant"
 	// KindApprovePolicy asks whether to accept a new or changed policy.
 	KindApprovePolicy Kind = "approve_policy"
+	// KindShutdown asks whether to stop the production daemon, which ends
+	// every grant and browser session.
+	KindShutdown Kind = "shutdown"
 )
 
 // Prompt is everything a dialog may show. Fields influenced by callers
@@ -32,6 +35,25 @@ type Prompt struct {
 	SessionKey string
 	Purpose    string
 	Detail     string // e.g. "POST /api/upload (412 bytes)"
+	// Policy describes the policy being approved (KindApprovePolicy).
+	Policy *PolicySummary
+}
+
+// PolicySummary is what an approve dialog shows about a policy: everything
+// that widens what curd may send on the user's behalf.
+type PolicySummary struct {
+	Rules []string // one summary per allow rule
+	// Cookies lists the allowed cookie-name patterns; empty with
+	// CookiesNone false means all cookies for the policy's hosts.
+	Cookies     []string
+	CookiesNone bool
+	// LocalStorage lists localStorage items used, e.g.
+	// "https://app.example.com authToken -> header Authorization".
+	LocalStorage    []string
+	Redirects       string
+	HeaderAllowlist []string // empty means the default allowlist
+	DefaultHeaders  []string // the default allowlist, shown when HeaderAllowlist is empty
+	ExecInspectors  []string // absolute paths of exec: inspectors
 }
 
 // Answer is the human's decision.

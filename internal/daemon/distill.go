@@ -7,13 +7,16 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/domnit/curd/internal/api"
 	"github.com/domnit/curd/internal/apierr"
 	"github.com/domnit/curd/internal/audit"
 	"github.com/domnit/curd/internal/broker"
+	"github.com/domnit/curd/internal/capture"
 	"github.com/domnit/curd/internal/distill"
+	"github.com/domnit/curd/internal/grants"
 	"github.com/domnit/curd/internal/policy"
 	"github.com/domnit/curd/internal/rpc"
 )
@@ -263,13 +266,76 @@ func (d *Daemon) distillVerify(ctx context.Context, p *api.DistillVerifyParams) 
 		return nil, s.ID, apierr.New(apierr.InvalidRequest, "no captured requests to replay", "pass capture ids: `curd distill verify "+p.Draft+" <id>...`")
 	}
 
-	res, narrowed, err := distill.Verify(ctx, draft, entries, brokerReplayer{d}, p.Minimize)
-	if err != nil {
+	// Replaying a write needs a write grant covering the exploration
+	// session's policies, and a non-safe request must never be sent more
+	// than once. distill.Verify replays every entry again when minimizing
+	// headers, so safe-method entries are verified (and minimized) in one
+	// call and write entries in a second call without minimize, which sends
+	// each of them exactly once. Write entries without the grant are
+	// skipped with a reason and never reach the broker.
+	canWrite := d.holdsWrite(m)
+	var safe, writes []*capture.Entry
+	skipped := map[string]string{}
+	for _, e := range entries {
+		switch {
+		case isSafeMethod(e.Method):
+			safe = append(safe, e)
+		case canWrite:
+			writes = append(writes, e)
+		default:
+			skipped[e.ID] = "replaying a write needs a write grant for this session's policies; open the session with `curd session open " +
+				strings.Join(m.policyNames(), " ") + " --write` and verify again"
+		}
+	}
+	replayer := brokerReplayer{d: d, scopes: d.grantScopes(m)}
+	var safeRes, writeRes *api.DistillVerifyResult
+	var narrowed *policy.Policy
+	var err2 error
+	if len(safe) > 0 {
+		safeRes, narrowed, err2 = distill.Verify(ctx, draft, safe, replayer, p.Minimize)
+	}
+	if err2 == nil && len(writes) > 0 {
+		writeRes, _, err2 = distill.Verify(ctx, draft, writes, replayer, false)
+	}
+	if err2 != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, s.ID, apierr.New(apierr.Internal, "verification was cancelled", "retry")
 		}
-		return nil, s.ID, apierr.As(err)
+		return nil, s.ID, apierr.As(err2)
 	}
+	res := &api.DistillVerifyResult{Items: []api.VerifyItem{}}
+	items := map[string]api.VerifyItem{}
+	for _, r := range []*api.DistillVerifyResult{safeRes, writeRes} {
+		if r == nil {
+			continue
+		}
+		for _, it := range r.Items {
+			items[it.ID] = it
+		}
+		if res.YAML == "" {
+			res.YAML = r.YAML
+		}
+	}
+	if res.YAML == "" {
+		if data, merr := policy.Marshal(draft); merr == nil {
+			res.YAML = string(data)
+		}
+	}
+	failures, tested := 0, 0
+	for _, e := range entries {
+		it, ok := items[e.ID]
+		if !ok {
+			it = api.VerifyItem{ID: e.ID, Method: e.Method, URL: e.URL, CapturedStatus: e.Status, Skipped: skipped[e.ID]}
+		}
+		if it.Skipped == "" {
+			tested++
+			if !it.OK {
+				failures++
+			}
+		}
+		res.Items = append(res.Items, it)
+	}
+	res.OK = tested > 0 && failures == 0
 	if narrowed != nil {
 		data, merr := policy.Marshal(narrowed)
 		if merr == nil {
@@ -284,7 +350,10 @@ func (d *Daemon) distillVerify(ctx context.Context, p *api.DistillVerifyParams) 
 
 // brokerReplayer replays a captured request through the fetch broker under a
 // draft policy, exactly as `curd fetch` would after approval.
-type brokerReplayer struct{ d *Daemon }
+type brokerReplayer struct {
+	d      *Daemon
+	scopes []string // scopes of the exploration session's grants
+}
 
 func (r brokerReplayer) Replay(ctx context.Context, pol *policy.Policy, req distill.ReplayRequest) (*distill.ReplayResponse, error) {
 	u, err := url.Parse(req.URL)
@@ -298,9 +367,50 @@ func (r brokerReplayer) Replay(ctx context.Context, pol *policy.Policy, req dist
 	if !dec.Allowed {
 		return nil, dec.Error()
 	}
-	resp, err := r.d.broker.Do(ctx, pol, broker.Request{Method: req.Method, URL: req.URL, Headers: req.Headers, Body: req.Body})
+	resp, err := r.d.broker.Do(ctx, pol, broker.Request{Method: req.Method, URL: req.URL, Headers: req.Headers, Body: req.Body, Scopes: r.scopes})
 	if err != nil {
 		return nil, apierr.As(err)
 	}
 	return &distill.ReplayResponse{Status: resp.Status, Headers: resp.Headers, Body: resp.Body}, nil
+}
+
+func isSafeMethod(m string) bool {
+	switch strings.ToUpper(m) {
+	case "GET", "HEAD", "OPTIONS":
+		return true
+	}
+	return false
+}
+
+// grantScopes is the union of the scopes of the session's live grants,
+// looked up by id.
+func (d *Daemon) grantScopes(m *sessMeta) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, id := range m.grantIDs {
+		if g, ok := d.grants.Get(id); ok {
+			for _, sc := range g.Scopes {
+				if !seen[sc] {
+					seen[sc] = true
+					out = append(out, sc)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// holdsWrite reports whether every grant the session depends on is live and
+// carries the write scope.
+func (d *Daemon) holdsWrite(m *sessMeta) bool {
+	if len(m.grantIDs) == 0 {
+		return false
+	}
+	for _, id := range m.grantIDs {
+		g, ok := d.grants.Get(id)
+		if !ok || !slices.Contains(g.Scopes, grants.ScopeWrite) {
+			return false
+		}
+	}
+	return true
 }

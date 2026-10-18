@@ -54,6 +54,17 @@ func (s *Server) Serve(ctx context.Context, socketPath string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create socket dir: %w", err)
 	}
+	// Serialize daemon startup: hold an exclusive lock on <socket>.lock for
+	// our whole lifetime, before looking at the socket, so a second daemon
+	// fails here instead of racing the stale-socket check and replacing a
+	// live socket.
+	lock, err := lockFile(socketPath + ".lock")
+	if err != nil {
+		return err
+	}
+	if lock != nil {
+		defer lock.Close() // released last, after the socket is removed
+	}
 	if fi, err := os.Lstat(socketPath); err == nil {
 		if fi.Mode()&os.ModeSocket == 0 {
 			return fmt.Errorf("%s exists and is not a socket", socketPath)
@@ -90,7 +101,17 @@ func (s *Server) Serve(ctx context.Context, socketPath string) error {
 		return fmt.Errorf("install socket: %w", err)
 	}
 	os.RemoveAll(tmp)
-	defer os.Remove(socketPath)
+	// Remove the socket on exit only if it is still the one we installed
+	// (we hold the lock, and the inode must be ours).
+	ours, _ := os.Lstat(socketPath)
+	defer func() {
+		if ours == nil {
+			return
+		}
+		if cur, err := os.Lstat(socketPath); err == nil && cur.Mode()&os.ModeSocket != 0 && os.SameFile(ours, cur) {
+			os.Remove(socketPath)
+		}
+	}()
 
 	s.mu.Lock()
 	if s.closed {
@@ -122,8 +143,11 @@ func (s *Server) Serve(ctx context.Context, socketPath string) error {
 			}
 			return fmt.Errorf("accept: %w", err)
 		}
-		peer, err := peerOf(conn)
-		if err != nil || peer.UID != os.Getuid() {
+		// Only the cheap uid check runs in the accept loop; process lookups
+		// (ps on darwin) happen in the connection goroutine so a slow one
+		// cannot stall accepting.
+		uid, pid, err := peerCred(conn)
+		if err != nil || uid != os.Getuid() {
 			conn.Close()
 			continue
 		}
@@ -135,6 +159,10 @@ func (s *Server) Serve(ctx context.Context, socketPath string) error {
 		go func() {
 			defer wg.Done()
 			defer s.untrack(conn)
+			peer := Peer{UID: uid, PID: pid}
+			if pid > 0 {
+				peer.Exe, peer.ParentPID, peer.ParentExe = procInfo(pid)
+			}
 			s.serveConn(sctx, conn, peer)
 		}()
 	}
@@ -282,17 +310,4 @@ func trimSpace(b []byte) []byte {
 		b = b[:len(b)-1]
 	}
 	return b
-}
-
-// peerOf gathers credentials for conn via platform-specific calls.
-func peerOf(conn *net.UnixConn) (Peer, error) {
-	uid, pid, err := peerCred(conn)
-	if err != nil {
-		return Peer{}, err
-	}
-	p := Peer{UID: uid, PID: pid}
-	if pid > 0 {
-		p.Exe, p.ParentPID, p.ParentExe = procInfo(pid)
-	}
-	return p, nil
 }

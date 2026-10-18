@@ -177,6 +177,10 @@ func (c Config) validateTest() error {
 type UserConfig struct {
 	// Keychain is prompt (default), always-allow or strict (spec 5.6).
 	Keychain string `yaml:"keychain,omitempty"`
+	// ChromeBinary is an absolute path to the Chrome executable to launch.
+	// The production daemon never honors $CURD_CHROME; this setting or a
+	// fixed well-known install path is all it uses.
+	ChromeBinary string `yaml:"chrome_binary,omitempty"`
 }
 
 // LoadUserConfig reads <configDir>/config.yaml. A missing file yields the
@@ -195,6 +199,7 @@ func LoadUserConfig(configDir string) (UserConfig, error) {
 	if err := yaml.Unmarshal(b, &in); err != nil {
 		return uc, fmt.Errorf("parse %s: %w", path, err)
 	}
+	uc.ChromeBinary = in.ChromeBinary
 	switch in.Keychain {
 	case "":
 	case source.KeychainPrompt, source.KeychainAlwaysAllow, source.KeychainStrict:

@@ -375,3 +375,57 @@ func TestHARShape(t *testing.T) {
 		t.Fatal("want not found")
 	}
 }
+
+func TestHAREncodedSecretNotDecodedBack(t *testing.T) {
+	const secret = "ab/cd+ef==SECRETTOKEN"
+	st := NewStore(Options{})
+	red := redact.New(redact.Secret{Value: secret, Placeholder: "{cookie:s}"})
+	rec := st.NewRecorder("s1", red, nil, nil)
+	rec.HandleEvent("cs", reqSent("a", "GET", "https://app.example.com/api?t=ab%2fcd%2bef%3d%3dSECRETTOKEN&u=ab%2Fcd%2Bef%3D%3DSECRETTOKEN&v=x", nil))
+	rec.HandleEvent("cs", reqSent("b", "POST", "https://app.example.com/api", m{"postData": `{"t":"ab\/cd+ef==SECRETTOKEN","u":"ab\/cd+ef==SECRETTOKEN"}`}))
+	rec.HandleEvent("cs", reqSent("c", "GET", "https://app.example.com/q?t=ab/cd%2Bef==SECRETTOKEN", nil))
+	har, err := st.ExportHAR("s1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(har)
+	if strings.Contains(string(b), "SECRETTOKEN") {
+		t.Fatalf("HAR leak: %s", b)
+	}
+	for _, s := range st.List("s1", api.CaptureFilter{}) {
+		if strings.Contains(s.URL, "SECRETTOKEN") {
+			t.Fatalf("List leak: %s", s.URL)
+		}
+	}
+	for _, id := range []string{"c1", "c2", "c3"} {
+		d, _ := st.Get(id, nil)
+		db, _ := json.Marshal(d)
+		if strings.Contains(string(db), "SECRETTOKEN") {
+			t.Fatalf("Get leak: %s", db)
+		}
+	}
+}
+
+func TestBase64BodyRescannedForLateSecret(t *testing.T) {
+	st := NewStore(Options{})
+	red := newRed()
+	const late = "late-binary-secret-42"
+	bin := base64.StdEncoding.EncodeToString(append([]byte{0, 1, 2, 0xff}, late...))
+	rec := st.NewRecorder("s1", red, fetcher(map[string]string{"a": bin}, true), nil)
+	rec.HandleEvent("cs", reqSent("a", "GET", "https://app.example.com/img", nil))
+	rec.HandleEvent("cs", ev("Network.loadingFinished", m{"requestId": "a"}))
+	rec.Wait()
+	if d, _ := st.Get("c1", nil); !d.BodyBase64 {
+		t.Fatalf("expected clean binary body kept: %+v", d)
+	}
+	red.Add(redact.Secret{Value: late, Placeholder: "{cookie:late}"})
+	d, _ := st.Get("c1", nil)
+	if d.BodyBase64 || !strings.Contains(d.ResponseBody, "dropped") {
+		t.Fatalf("late secret in binary body not dropped: %+v", d)
+	}
+	har, _ := st.ExportHAR("s1", nil)
+	hb, _ := json.Marshal(har)
+	if strings.Contains(string(hb), bin) {
+		t.Fatal("HAR still has binary body")
+	}
+}

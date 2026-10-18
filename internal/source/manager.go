@@ -79,7 +79,7 @@ func NewManager(src creds.Source, opts Options) *Manager {
 func RequestFor(p *policy.Policy) creds.Request {
 	req := creds.Request{
 		Hosts:       append([]string(nil), p.Match.Hosts...),
-		CookieNames: append([]string(nil), p.Credentials.Cookies...),
+		CookieNames: p.CookieRequestNames(),
 		Profile:     p.Profile,
 	}
 	for _, ls := range p.Credentials.LocalStorage {

@@ -453,6 +453,16 @@ func TestStatusAuditAndShutdown(t *testing.T) {
 	if err := e.cl.Call(context.Background(), api.MethodShutdown, nil, nil); err != nil {
 		t.Fatal(err)
 	}
+	var sawShutdown bool
+	al, _ := os.ReadFile(config.TestPaths(e.dir).AuditLog)
+	for _, ln := range strings.Split(string(al), "\n") {
+		if strings.Contains(ln, `"event":"shutdown"`) && strings.Contains(ln, fmt.Sprintf(`"client_pid":%d`, os.Getpid())) {
+			sawShutdown = true
+		}
+	}
+	if !sawShutdown {
+		t.Fatalf("shutdown not audited with the caller's pid:\n%s", al)
+	}
 	select {
 	case err := <-e.done:
 		if err != nil {

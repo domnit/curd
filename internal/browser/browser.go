@@ -49,6 +49,13 @@ type Recorder interface {
 	MarkBlocked(networkRequestID, reason string, blockedWrite bool, req BlockedRequest)
 }
 
+// BodyOmitter is optionally implemented by a Recorder. The browser calls it
+// for requests whose body must not be recorded (login form submissions carry
+// the typed password). It may arrive before or after the request's events.
+type BodyOmitter interface {
+	OmitRequestBody(networkRequestID, reason string)
+}
+
 // BlockedRequest describes a request curd blocked. Values are raw; the
 // recorder redacts them.
 type BlockedRequest struct {

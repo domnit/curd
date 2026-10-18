@@ -24,7 +24,19 @@ var alwaysDropped = map[string]bool{
 	"transfer-encoding":   true,
 }
 
+// methodOverrideHeaders let a request claim a different method than the one
+// the policy checked; they may never be allowlisted.
+var methodOverrideHeaders = map[string]bool{
+	"x-http-method-override": true,
+	"x-http-method":          true,
+	"x-method-override":      true,
+}
+
 var defaultHeaderAllowlist = []string{"accept", "accept-language", "content-type"}
+
+// DefaultHeaderAllowlist returns the caller headers kept when a policy has
+// no request.header_allowlist.
+func DefaultHeaderAllowlist() []string { return append([]string(nil), defaultHeaderAllowlist...) }
 
 // FilterRequestHeaders keeps only the caller headers the policy allows.
 // dropped holds the names (never values) of removed headers.

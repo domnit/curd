@@ -127,6 +127,7 @@ func (d *Daemon) fetch(ctx context.Context, peer rpc.Peer, p *api.FetchParams, r
 	}
 	rec.GrantID = g.ID
 	rec.TokenHash = audit.HashToken(g.Token)
+	breq.Scopes = g.Scopes // redirect hops are checked against what the grant allows
 
 	resp, err := d.broker.Do(ctx, pol, breq)
 	if err != nil {

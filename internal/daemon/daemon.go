@@ -57,6 +57,7 @@ type Daemon struct {
 	mu            sync.Mutex
 	onShutdown    []func()
 	onRevoked     []func(*grants.Grant)
+	chromeBin     string // resolved Chrome executable ("" = none found)
 	sessionCount  func() int
 	cancel        context.CancelFunc
 	ran           bool
@@ -69,12 +70,16 @@ func New(cfg Config) (*Daemon, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = nopLogger{}
 	}
-	if cfg.Mode == config.ModeProd && cfg.KeychainMode == "" {
+	var chromeBin string // production: from config.yaml only, never the environment
+	if cfg.Mode == config.ModeProd {
 		uc, err := LoadUserConfig(cfg.Paths.ConfigDir)
 		if err != nil {
 			return nil, err
 		}
-		cfg.KeychainMode = uc.Keychain
+		if cfg.KeychainMode == "" {
+			cfg.KeychainMode = uc.Keychain
+		}
+		chromeBin = uc.ChromeBinary
 	}
 	if cfg.Mode == config.ModeTest && cfg.KeychainMode == "" {
 		cfg.KeychainMode = "mock"
@@ -136,14 +141,19 @@ func New(cfg Config) (*Daemon, error) {
 				return nil, err
 			}
 		}
-		d.userAgent = userAgentFor(tc.Source.UserDataDir, tc.ChromeBinary)
+		d.chromeBin = tc.ChromeBinary
+		if d.chromeBin == "" {
+			d.chromeBin, _ = chrome.FindBinary() // test mode may use $CURD_CHROME
+		}
+		d.userAgent = userAgentFor(tc.Source.UserDataDir, d.chromeBin)
 	} else {
 		d.prompter = consent.NewNative()
 		d.src, err = source.NewChrome(source.ChromeOptions{KeyMode: cfg.KeychainMode})
 		if err != nil {
 			return nil, err
 		}
-		bin, _ := chrome.FindBinary()
+		bin, _ := chrome.FindBinaryFor(false, chromeBin)
+		d.chromeBin = bin
 		d.userAgent = userAgentFor(chrome.DefaultUserDataDir(), bin)
 	}
 	d.sources = source.NewManager(d.src, source.Options{})

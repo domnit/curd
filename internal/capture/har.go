@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/domnit/curd/internal/api"
+	"github.com/domnit/curd/internal/redact"
 )
 
 const harTime = "2006-01-02T15:04:05.000Z07:00"
@@ -47,13 +48,19 @@ func (s *Store) ExportHAR(sessionID string, ids []string) (map[string]any, error
 	if err != nil {
 		return nil, err
 	}
+	s.mu.Lock()
+	red := s.redactor(sessionID)
+	s.mu.Unlock()
 	entries := make([]any, 0, len(es))
 	for _, e := range es {
 		qs := []map[string]any{}
+		// e.URL is already redacted; decoding its query can still turn an
+		// encoded form back into a raw value, so each decoded name and
+		// value is redacted again (and so is the whole document below).
 		if u, err := url.Parse(e.URL); err == nil {
 			for k, vs := range u.Query() {
 				for _, v := range vs {
-					qs = append(qs, map[string]any{"name": k, "value": v})
+					qs = append(qs, map[string]any{"name": red.String(k), "value": red.String(v)})
 				}
 			}
 		}
@@ -97,11 +104,36 @@ func (s *Store) ExportHAR(sessionID string, ids []string) (map[string]any, error
 			},
 		})
 	}
-	return map[string]any{"log": map[string]any{
+	har := map[string]any{"log": map[string]any{
 		"version": "1.2",
 		"creator": map[string]any{"name": "curd", "version": "1"},
 		"entries": entries,
-	}}, nil
+	}}
+	return redactTree(red, har).(map[string]any), nil
+}
+
+// redactTree redacts every string in a HAR value built from maps and slices.
+func redactTree(red *redact.Redactor, v any) any {
+	switch x := v.(type) {
+	case string:
+		return red.String(x)
+	case map[string]any:
+		for k, e := range x {
+			x[k] = redactTree(red, e)
+		}
+		return x
+	case []map[string]any:
+		for i, e := range x {
+			x[i] = redactTree(red, e).(map[string]any)
+		}
+		return x
+	case []any:
+		for i, e := range x {
+			x[i] = redactTree(red, e)
+		}
+		return x
+	}
+	return v
 }
 
 func locationOf(h []api.Header) string {

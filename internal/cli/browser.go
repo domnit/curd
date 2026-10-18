@@ -202,9 +202,10 @@ cookies or storage, and everything returned is redacted.
   login [done]
   capture list|get|find-source|export     read the recorded network traffic
 
-Selectors are CSS selectors. Navigation outside the session's policy hosts is
-blocked, and a read-only session blocks the page's writes (recorded as
-blocked_write). Use --session <id> to pick a session; the default is your most
+Selectors are CSS selectors. Only https (and http in test mode) pages on the
+session's policy hosts can be opened; data:, blob: and javascript: URLs are
+refused. A read-only session blocks the page's writes (recorded as
+blocked_write), including WebSocket connections to policy hosts. Use --session <id> to pick a session; the default is your most
 recent one.
 
 Typical exploration: session open -> browse open <url> -> click around ->

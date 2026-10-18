@@ -1,6 +1,7 @@
 package browser
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -101,16 +102,39 @@ func (s *Session) Do(ctx context.Context, verb string, args []string) (*api.Brow
 	return res, out
 }
 
+// redactData redacts structured verb data field by field: it is normalized
+// through JSON (so strings are decoded, not escaped) and every string value
+// and map key is passed through the redactor. Redacting the marshalled text
+// would miss values the encoder escaped.
 func (s *Session) redactData(d any) any {
 	b, err := json.Marshal(d)
 	if err != nil {
 		return nil
 	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
 	var v any
-	if json.Unmarshal([]byte(s.red.String(string(b))), &v) != nil {
-		// Redaction broke the JSON (a secret inside an escape): fall back to
-		// redacting the escaped text as a string.
-		return s.red.String(string(b))
+	if dec.Decode(&v) != nil {
+		return nil
+	}
+	return s.redactValue(v)
+}
+
+func (s *Session) redactValue(v any) any {
+	switch x := v.(type) {
+	case string:
+		return s.red.String(x)
+	case []any:
+		for i := range x {
+			x[i] = s.redactValue(x[i])
+		}
+		return x
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, e := range x {
+			out[s.red.String(k)] = s.redactValue(e)
+		}
+		return out
 	}
 	return v
 }
@@ -470,10 +494,10 @@ func (s *Session) vLogin(ctx context.Context) (*api.BrowseResult, error) {
 	if s.Seed == SeedLogin {
 		fmt.Fprintf(&b, "interactive login session (nothing was seeded)\nlogin page: %s\n", s.startURL)
 		b.WriteString("sign in in the browser window, then continue with `url`, `title`, `text <selector>`.\n")
-		b.WriteString("a human must complete any password, 2FA or captcha step; curd does not see or store what they type.\n")
+		b.WriteString("a human should complete any password, 2FA or captcha step in the browser window. Login form submissions (Document POSTs) are never recorded: their bodies are dropped from capture, so typed passwords do not reach `capture get`/export. Text sent with `browse type` is visible to whoever runs the verb.\n")
 		if s.inLoginPhase() {
-			b.WriteString("login phase: open; form submissions to policy hosts are allowed so the user can sign in.\n")
-			b.WriteString("run `login done` once signed in (it also ends by itself after 10 minutes); after that the session is read-only unless opened with --write.\n")
+			b.WriteString("login phase: open; a same-origin form submission from a policy-host page is allowed so the user can sign in.\n")
+			b.WriteString("the phase ends as soon as the browser receives a new session cookie, on `login done`, or after 10 minutes; after that the session is read-only unless opened with --write.\n")
 		} else {
 			b.WriteString("login phase: closed; writes need a session opened with --write.\n")
 		}

@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -211,7 +212,9 @@ func (e *env) do(b *Broker, p *policy.Policy, method, u string, hdrs []api.Heade
 	if body != "" {
 		bb = []byte(body)
 	}
-	return b.Do(context.Background(), p, Request{Method: method, URL: u, Headers: hdrs, Body: bb})
+	// basePolicy's rule allows POST, so it is write-scoped and the daemon
+	// would already have required a write grant.
+	return b.Do(context.Background(), p, Request{Method: method, URL: u, Headers: hdrs, Body: bb, Scopes: []string{"read", "write"}})
 }
 
 func hdr(kv ...string) []api.Header {
@@ -881,5 +884,109 @@ func TestNoSecretsInErrors(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("sanity: secret was never sent")
+	}
+}
+
+func TestRedirectHopNeedsGrantedScope(t *testing.T) {
+	const y = `
+name: dash
+match:
+  hosts: [app.example.com]
+allow:
+  - methods: [POST]
+    paths: ['^/graphql$']
+    inspect: graphql_query_only
+  - methods: [POST]
+    paths: ['^/api/delete$']
+  - methods: [GET]
+    paths: ['^/read/.*$']
+test:
+  host_map:
+    app.example.com: 127.0.0.1
+`
+	p, err := policy.Parse([]byte(y), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"query":"{ me }"}`)
+	e := newEnv(t)
+	b, _ := e.broker(true)
+	e.handle(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/graphql":
+			http.Redirect(w, r, "/api/delete", http.StatusTemporaryRedirect)
+		case "/read/a":
+			http.Redirect(w, r, "/read/b", http.StatusFound)
+		default:
+			w.Write([]byte("done"))
+		}
+	})
+	for _, scopes := range [][]string{nil, {"read"}} {
+		e.reset()
+		resp, err := b.Do(context.Background(), p, Request{Method: "POST", URL: e.url("app.example.com", "/graphql"),
+			Headers: hdr("Content-Type", "application/json"), Body: body, Scopes: scopes})
+		mustOK(t, resp, err)
+		if resp.Status != 307 || !strings.Contains(resp.RedirectBlocked, "write scope") {
+			t.Fatalf("scopes %v: read grant followed redirect into write rule: %+v", scopes, resp)
+		}
+		if rs := e.recs(); len(rs) != 1 {
+			t.Fatalf("scopes %v: write endpoint was called: %+v", scopes, rs)
+		}
+	}
+	// A write grant may follow it.
+	e.reset()
+	resp, err := b.Do(context.Background(), p, Request{Method: "POST", URL: e.url("app.example.com", "/graphql"),
+		Headers: hdr("Content-Type", "application/json"), Body: body, Scopes: []string{"read", "write"}})
+	mustOK(t, resp, err)
+	if resp.Status != 200 || resp.RedirectBlocked != "" || len(e.recs()) != 2 {
+		t.Fatalf("write grant: %+v", resp)
+	}
+	// A read hop under a read grant is still followed.
+	resp, err = b.Do(context.Background(), p, Request{Method: "GET", URL: e.url("app.example.com", "/read/a")})
+	mustOK(t, resp, err)
+	if resp.Status != 200 || resp.Hops != 1 {
+		t.Fatalf("read hop: %+v", resp)
+	}
+}
+
+func TestResponseHeldValuesRedacted(t *testing.T) {
+	e := newEnv(t)
+	b, _ := e.broker(true)
+	e.handle(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redir" {
+			w.Header().Set("Location", "/x?c="+url.QueryEscape(r.Header.Get("Cookie")))
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		w.Header().Set("X-Echo-Cookie", r.Header.Get("Cookie"))
+		w.Header().Set("X-Echo-Auth", r.Header.Get("Authorization"))
+		w.Write([]byte("cookie=" + r.Header.Get("Cookie") + " auth=" + r.Header.Get("Authorization") +
+			" json=" + strings.ReplaceAll(secretToken, "T", `\u0054`)))
+	})
+	resp, err := e.do(b, pol(t), "GET", e.url("app.example.com", "/echo"), nil, "")
+	mustOK(t, resp, err)
+	all := string(resp.Body) + fmt.Sprint(resp.Headers) + resp.URL
+	for _, sec := range []string{secretSession, secretToken} {
+		if strings.Contains(all, sec) {
+			t.Fatalf("held value %q returned: %s", sec, all)
+		}
+	}
+	if !strings.Contains(string(resp.Body), "{cookie:session}") || !strings.Contains(string(resp.Body), "{ls:https://app.example.com:authToken}") {
+		t.Fatalf("placeholders missing: %s", resp.Body)
+	}
+	// Redirect blocked (none): the returned Location must not carry it.
+	resp, err = e.do(b, pol(t, "request:", "redirects: none\nrequest:"), "GET", e.url("app.example.com", "/redir"), nil, "")
+	mustOK(t, resp, err)
+	if strings.Contains(fmt.Sprint(resp.Headers), secretSession) {
+		t.Fatalf("Location leak: %v", resp.Headers)
+	}
+	// A held value cut by the size cap is not partially returned.
+	e.handle(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("xxxxxxxx" + secretSession))
+	})
+	resp, err = e.do(b, pol(t, "request:", "response:\n  max_body_bytes: 14\nrequest:"), "GET", e.url("app.example.com", "/cap"), nil, "")
+	mustOK(t, resp, err)
+	if strings.Contains(string(resp.Body), secretSession[:6]) {
+		t.Fatalf("partial held value at cap: %q", resp.Body)
 	}
 }

@@ -217,15 +217,7 @@ func (d *Daemon) approvePolicy(ctx context.Context, peer rpc.Peer, name string) 
 			"draft %q cannot be approved: %s", name, msg)
 	}
 
-	var sums []string
-	for i := range pol.Allow {
-		sums = append(sums, pol.Allow[i].Summary())
-	}
-	detail := strings.Join(sums, "; ")
-	ans, err := d.prompter.Ask(ctx, consent.Prompt{
-		Kind: consent.KindApprovePolicy, Policies: []string{name}, Hosts: pol.Match.Hosts,
-		ClientName: clientOf(peer).Name, ClientPID: clientOf(peer).PID, Detail: detail,
-	})
+	ans, err := d.prompter.Ask(ctx, approvePrompt(pol, peer))
 	if err != nil || ans != consent.Approve {
 		msg := "the user declined to approve the policy"
 		if err != nil {
@@ -263,4 +255,47 @@ func (d *Daemon) approvePolicy(ctx context.Context, peer rpc.Peer, name string) 
 		st.Rules = append(st.Rules, np.Allow[i].Summary())
 	}
 	return st, nil
+}
+
+// approvePrompt describes everything a policy would allow: every rule, the
+// credentials it uses, the headers callers may set, redirects, and exec
+// inspectors it would run. The dialog never drops entries silently.
+func approvePrompt(pol *policy.Policy, peer rpc.Peer) consent.Prompt {
+	ps := &consent.PolicySummary{
+		Cookies:         append([]string(nil), pol.Credentials.Cookies...),
+		CookiesNone:     pol.Credentials.CookiesNone,
+		Redirects:       pol.Redirects,
+		HeaderAllowlist: append([]string(nil), pol.Request.HeaderAllowlist...),
+		DefaultHeaders:  policy.DefaultHeaderAllowlist(),
+	}
+	for i := range pol.Allow {
+		ps.Rules = append(ps.Rules, pol.Allow[i].Summary())
+		if in := pol.Allow[i].Inspect; strings.HasPrefix(in, policy.InspectExecPrefix) {
+			ps.ExecInspectors = appendExecPath(ps.ExecInspectors, strings.TrimPrefix(in, policy.InspectExecPrefix))
+		}
+	}
+	for _, ls := range pol.Credentials.LocalStorage {
+		for _, k := range ls.Keys {
+			item := ls.Origin + " " + k
+			if ls.InjectAs != "" {
+				if h, _, ok := strings.Cut(strings.TrimPrefix(ls.InjectAs, "header:"), ":"); ok {
+					item += " -> header " + h
+				}
+			}
+			ps.LocalStorage = append(ps.LocalStorage, item)
+		}
+	}
+	return consent.Prompt{
+		Kind: consent.KindApprovePolicy, Policies: []string{pol.Name}, Hosts: pol.Match.Hosts,
+		ClientName: clientOf(peer).Name, ClientPID: clientOf(peer).PID, Policy: ps,
+	}
+}
+
+func appendExecPath(l []string, v string) []string {
+	for _, x := range l {
+		if x == v {
+			return l
+		}
+	}
+	return append(l, v)
 }

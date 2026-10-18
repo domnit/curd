@@ -15,7 +15,7 @@ import (
 
 // LaunchOptions configures Launch.
 type LaunchOptions struct {
-	Binary       string    // path to Chrome; FindBinary() if empty
+	Binary       string    // path to Chrome; FindBinaryFor(false, "") if empty
 	UserDataDir  string    // required
 	Headless     bool      // --headless=new
 	MockKeychain bool      // test only: fixed, publicly known cookie key (see MockProvider)
@@ -44,7 +44,8 @@ func Launch(ctx context.Context, o LaunchOptions) (*Browser, error) {
 	bin := o.Binary
 	if bin == "" {
 		var err error
-		if bin, err = FindBinary(); err != nil {
+		// Production-safe lookup: no environment override.
+		if bin, err = FindBinaryFor(false, ""); err != nil {
 			return nil, err
 		}
 	}

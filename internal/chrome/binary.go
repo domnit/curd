@@ -16,16 +16,33 @@ import (
 )
 
 // ErrNoBinary is returned by FindBinary when no browser could be found.
-var ErrNoBinary = errors.New("chrome: no Chrome/Chromium binary found; set " + config.EnvChrome + " to its path")
+var ErrNoBinary = errors.New("chrome: no Chrome/Chromium binary found; set chrome_binary in ~/.config/curd/config.yaml")
 
-// FindBinary locates a Chrome or Chromium executable. $CURD_CHROME wins;
-// otherwise well-known locations for the current OS are tried.
-func FindBinary() (string, error) {
-	if p := os.Getenv(config.EnvChrome); p != "" {
-		if st, err := os.Stat(p); err != nil || st.IsDir() {
-			return "", fmt.Errorf("chrome: %s=%q is not an executable file", config.EnvChrome, p)
+// FindBinary is the test/development lookup: $CURD_CHROME wins, then the
+// well-known locations. It must not be used by the production daemon (it
+// would let the environment pick the program that receives hoisted cookies);
+// production code uses FindBinaryFor(false, configured).
+func FindBinary() (string, error) { return FindBinaryFor(true, "") }
+
+// FindBinaryFor locates a Chrome or Chromium executable. With allowEnv
+// (test mode only) $CURD_CHROME is honored first. In production allowEnv is
+// false: the environment is ignored and only configured (the chrome_binary
+// setting of ~/.config/curd/config.yaml, or "") or a fixed well-known
+// install path is used. A configured path takes precedence over discovery.
+func FindBinaryFor(allowEnv bool, configured string) (string, error) {
+	if allowEnv {
+		if p := os.Getenv(config.EnvChrome); p != "" {
+			if !isFile(p) {
+				return "", fmt.Errorf("chrome: %s=%q is not an executable file", config.EnvChrome, p)
+			}
+			return p, nil
 		}
-		return p, nil
+	}
+	if configured != "" {
+		if !filepath.IsAbs(configured) || !isFile(configured) {
+			return "", fmt.Errorf("chrome: configured chrome_binary %q is not an absolute path to an executable file", configured)
+		}
+		return configured, nil
 	}
 	home, _ := os.UserHomeDir()
 	switch runtime.GOOS {
@@ -41,10 +58,25 @@ func FindBinary() (string, error) {
 			}
 		}
 	default:
-		for _, n := range []string{"google-chrome", "google-chrome-stable", "chromium", "chromium-browser"} {
-			if p, err := exec.LookPath(n); err == nil {
-				return p, nil
+		if allowEnv {
+			// PATH lookup is a test/dev convenience; production only trusts
+			// fixed install locations.
+			for _, n := range []string{"google-chrome", "google-chrome-stable", "chromium", "chromium-browser"} {
+				if p, err := exec.LookPath(n); err == nil {
+					return p, nil
+				}
 			}
+		} else {
+			for _, p := range []string{
+				"/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
+				"/opt/google/chrome/chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser",
+				"/snap/bin/chromium",
+			} {
+				if isFile(p) {
+					return p, nil
+				}
+			}
+			return "", ErrNoBinary
 		}
 		matches, _ := filepath.Glob("/opt/pw-browsers/chromium-*/chrome-linux/chrome")
 		sort.Strings(matches)

@@ -28,8 +28,7 @@ const sessionHint = "open one with `curd session open <policy>` (see `curd polic
 // and which grants it depends on. The browser package knows only the owner.
 type sessMeta struct {
 	id         string
-	grantIDs   []string // one grant per policy; the first is the browser Owner
-	once       bool     // opened under a "once" grant: already consumed, so no grant to re-check
+	grantIDs   []string // one live grant per policy (an "allow once" consent is replaced by an internal session-lifetime grant); the first is the browser Owner
 	sessionKey string
 	policies   []*policy.Policy
 	write      bool
@@ -106,8 +105,8 @@ func (d *Daemon) registerBrowser() {
 		},
 		OnEvent: d.sessionEvent,
 	}
+	opts.Binary = d.chromeBin
 	if d.Test() {
-		opts.Binary = d.cfg.Test.ChromeBinary
 		opts.TempRoot = filepath.Join(d.cfg.Test.Dir, "tmp")
 		_ = os.MkdirAll(opts.TempRoot, 0o700)
 	}
@@ -152,7 +151,7 @@ func (d *Daemon) closeForGrant(g *grants.Grant) {
 	b.mu.Lock()
 	var ids []string
 	for id, m := range b.sess {
-		if !m.once && m.hasGrant(g.ID) {
+		if m.hasGrant(g.ID) {
 			ids = append(ids, id)
 		}
 	}
@@ -208,6 +207,8 @@ func (d *Daemon) sessionEvent(ev browser.SessionEvent) {
 		if ev.BlockedWrite {
 			rec.Tags = append(rec.Tags, "blocked_write")
 		}
+	case "login_end":
+		rec.Event = "login_end"
 	case "login_post":
 		// A login form submission let through during the login phase.
 		rec.Event, rec.Method, rec.Host = "login_post", ev.Method, ev.Host
@@ -306,13 +307,29 @@ func (d *Daemon) openSession(ctx context.Context, peer rpc.Peer, p *api.OpenSess
 	meta := &sessMeta{sessionKey: p.SessionKey, policies: pols, write: p.AllowWrites, explore: p.Explore}
 	expires := time.Now().Add(ttl)
 	var newToken string
+	var onceGrants []*grants.Grant // consumed "allow once" grants, to be replaced
+	var internal []string          // internal grants minted for this open, revoked if it fails
+	fail := func(err error) (*api.OpenSessionResult, string, error) {
+		for _, id := range internal {
+			d.grants.Revoke(id)
+		}
+		return nil, "", err
+	}
 	for _, pol := range pols {
 		g, minted, err := d.acquire(ctx, peer, fp, pol, scope, detail)
 		if err != nil {
-			return nil, "", err
+			return fail(err)
+		}
+		if g.Mode == grants.ModeOnce {
+			// A once grant is consumed by the acquire above and cannot own a
+			// session. Its consent buys a session-lifetime internal grant
+			// instead, so revoking grants closes the session. Internal
+			// grants are never reachable by session-key matching.
+			onceGrants = append(onceGrants, g)
+			meta.grantIDs = append(meta.grantIDs, "")
+			continue
 		}
 		meta.grantIDs = append(meta.grantIDs, g.ID)
-		meta.once = meta.once || g.Mode == grants.ModeOnce
 		if g.ExpiresAt.Before(expires) {
 			expires = g.ExpiresAt
 		}
@@ -322,7 +339,27 @@ func (d *Daemon) openSession(ctx context.Context, peer rpc.Peer, p *api.OpenSess
 	}
 	ttl = time.Until(expires)
 	if ttl <= 0 {
-		return nil, "", apierr.New(apierr.InvalidToken, "the grant has expired", "request a new one with `curd grants request "+strings.Join(p.Policies, " ")+"`")
+		return fail(apierr.New(apierr.InvalidToken, "the grant has expired", "request a new one with `curd grants request "+strings.Join(p.Policies, " ")+"`"))
+	}
+	cl := clientOf(peer)
+	oi := 0
+	for i, pol := range pols {
+		if meta.grantIDs[i] != "" {
+			continue
+		}
+		og := onceGrants[oi]
+		oi++
+		ig := d.grants.Mint(grants.MintSpec{
+			Policies: []string{pol.Name}, Scopes: og.Scopes, Mode: grants.ModeSession, TTL: ttl,
+			SessionKey: fp.SessionKey, SessionKeySource: fp.SessionKeySource,
+			ClientPID: cl.PID, ClientExe: cl.Exe, Purpose: "browser session", Internal: true,
+		})
+		internal = append(internal, ig.ID)
+		meta.grantIDs[i] = ig.ID
+		d.writeAudit(audit.Record{
+			Event: "grant", ClientPID: cl.PID, ClientExe: cl.Exe, GrantID: ig.ID, TokenHash: audit.HashToken(ig.Token),
+			SessionKey: fp.SessionKey, Policy: pol.Name, Decision: "allow", Tags: []string{"session", scope, "internal"},
+		})
 	}
 
 	if seed == "" {
@@ -334,9 +371,12 @@ func (d *Daemon) openSession(ctx context.Context, peer rpc.Peer, p *api.OpenSess
 	}
 	s, err := d.bs.mgr.Open(ctx, spec)
 	if err != nil {
-		return nil, "", err
+		return fail(err)
 	}
 	meta.id = s.ID
+	for _, id := range internal {
+		d.grants.SetPurpose(id, "browser session "+s.ID)
+	}
 	d.bs.mu.Lock()
 	d.bs.sess[s.ID] = meta
 	d.bs.order = append(d.bs.order, s.ID)
@@ -396,11 +436,11 @@ func (d *Daemon) authorizeSession(c api.Caller, m *sessMeta) error {
 	if c.SessionKey != m.sessionKey {
 		return notYours
 	}
-	if m.once {
-		return nil
-	}
-	for _, p := range m.policies {
-		if _, err := d.grants.Peek("", c.SessionKey, p.Name, grants.ScopeRead); err != nil {
+	// Same key is not enough: every grant the session depends on (looked up
+	// by id, so an unrelated grant with the same key does not count) must
+	// still be live.
+	for _, id := range m.grantIDs {
+		if _, ok := d.grants.Get(id); !ok {
 			return notYours
 		}
 	}
@@ -502,17 +542,15 @@ func (d *Daemon) handleBrowse(ctx context.Context, peer rpc.Peer, raw json.RawMe
 			SessionID: p.SessionID, Verb: strings.ToLower(p.Verb), Decision: decisionFor(apierr.CodeOf(err)), Code: apierr.CodeOf(err)})
 		return nil, err
 	}
-	d.touch(p.Caller, m)
+	d.touch(m)
 	return s.Do(ctx, p.Verb, p.Args)
 }
 
-// touch records a use of the session's grants so an active session does not
-// idle out.
-func (d *Daemon) touch(c api.Caller, m *sessMeta) {
-	if m.once {
-		return
-	}
-	for _, p := range m.policies {
-		_, _ = d.grants.Authorize(c.Token, c.SessionKey, p.Name, grants.ScopeRead)
+// touch records a use of the session's own grants (by id, never by session
+// key, so it cannot consume an unrelated "once" grant) so an active session
+// does not idle out.
+func (d *Daemon) touch(m *sessMeta) {
+	for _, id := range m.grantIDs {
+		d.grants.Touch(id)
 	}
 }

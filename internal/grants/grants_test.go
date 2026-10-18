@@ -242,3 +242,37 @@ func TestConcurrentOnce(t *testing.T) {
 		t.Fatalf("once grant used %d times", ok)
 	}
 }
+
+func TestInternalGrantAndTouch(t *testing.T) {
+	s := NewStore(Options{})
+	g := s.Mint(MintSpec{Policies: []string{"app"}, Scopes: []string{ScopeRead}, SessionKey: "k", Internal: true})
+	// Never found by session-key matching...
+	if _, err := s.Authorize("", "k", "app", ScopeRead); err == nil {
+		t.Fatal("internal grant matched by session key")
+	}
+	if _, err := s.Peek("", "k", "app", ScopeRead); err == nil {
+		t.Fatal("internal grant peeked by session key")
+	}
+	// ...but reachable by id and token.
+	if _, ok := s.Get(g.ID); !ok {
+		t.Fatal("no lookup by id")
+	}
+	if _, err := s.Authorize(g.Token, "", "app", ScopeRead); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Touch(g.ID) || s.Touch("gr_nosuch") {
+		t.Fatal("Touch result wrong")
+	}
+	// Touch never consumes a once grant.
+	o := s.Mint(MintSpec{Policies: []string{"app"}, Mode: ModeOnce, SessionKey: "k"})
+	if !s.Touch(o.ID) {
+		t.Fatal("once grant gone after Touch")
+	}
+	if _, ok := s.Get(o.ID); !ok {
+		t.Fatal("Touch consumed a once grant")
+	}
+	s.Revoke(g.ID)
+	if s.Touch(g.ID) {
+		t.Fatal("Touch revived a revoked grant")
+	}
+}

@@ -3,7 +3,9 @@ package source
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -73,13 +75,97 @@ func NewChrome(opts ChromeOptions) (creds.Source, error) {
 	return &chromeSource{opts: opts}, nil
 }
 
+// realProfileRoots are the data roots of every browser whose profile test
+// mode must never open, for both darwin and linux layouts (listing both is
+// harmless and keeps a copied config from smuggling a path through).
+func realProfileRoots(home string) []string {
+	mac := filepath.Join(home, "Library", "Application Support")
+	cfg := filepath.Join(home, ".config")
+	return []string{
+		filepath.Join(mac, "Google", "Chrome"),
+		filepath.Join(mac, "Google", "Chrome Beta"),
+		filepath.Join(mac, "Google", "Chrome Canary"),
+		filepath.Join(mac, "Google", "Chrome Dev"),
+		filepath.Join(mac, "Chromium"),
+		filepath.Join(mac, "BraveSoftware", "Brave-Browser"),
+		filepath.Join(mac, "Microsoft Edge"),
+		filepath.Join(mac, "Vivaldi"),
+		filepath.Join(cfg, "google-chrome"),
+		filepath.Join(cfg, "google-chrome-beta"),
+		filepath.Join(cfg, "google-chrome-unstable"),
+		filepath.Join(cfg, "chromium"),
+		filepath.Join(cfg, "BraveSoftware", "Brave-Browser"),
+		filepath.Join(cfg, "microsoft-edge"),
+		filepath.Join(cfg, "vivaldi"),
+		filepath.Join(home, "snap", "chromium", "common", "chromium"),
+	}
+}
+
+// resolvePath makes p absolute and resolves symlinks. A path that does not
+// exist yet is resolved through its longest existing ancestor.
+func resolvePath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	rest := ""
+	cur := abs
+	for {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(r, rest), nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
+}
+
+// isRealProfileDir reports whether dir is, or is inside, the data root of
+// any real browser. Both sides are compared after symlink resolution, and
+// case-insensitively on darwin (default APFS). Anything it cannot resolve is
+// refused.
 func isRealProfileDir(dir string) bool {
-	real, err1 := filepath.Abs(chrome.DefaultUserDataDir())
-	d, err2 := filepath.Abs(dir)
-	if err1 != nil || err2 != nil {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
 		return true
 	}
-	return d == real || strings.HasPrefix(d, real+string(filepath.Separator))
+	return isRealProfileDirIn(dir, home, runtime.GOOS)
+}
+
+func isRealProfileDirIn(dir, home, goos string) bool {
+	d, err := resolvePath(dir)
+	if err != nil {
+		return true
+	}
+	homes := []string{home}
+	if r, err := resolvePath(home); err == nil && r != home {
+		homes = append(homes, r)
+	}
+	fold := func(s string) string {
+		if goos == "darwin" {
+			return strings.ToLower(s)
+		}
+		return s
+	}
+	d = fold(d)
+	for _, h := range homes {
+		for _, root := range realProfileRoots(h) {
+			r, err := resolvePath(root)
+			if err != nil {
+				return true
+			}
+			for _, cand := range []string{root, r} {
+				cand = fold(cand)
+				if d == cand || strings.HasPrefix(d, cand+string(filepath.Separator)) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (s *chromeSource) Name() string { return "chrome" }

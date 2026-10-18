@@ -350,6 +350,13 @@ allow:
 		for _, args := range [][]string{{"browse", "html", "body"}, {"browse", "capture", "export"}} {
 			wantCode(t, e.bcurd(args...), 0)
 		}
+		// The typed password never reaches the capture API: not in the
+		// export, the listing, or the login POST's own entry.
+		for _, args := range [][]string{{"browse", "capture", "export"}, {"browse", "capture", "get", capID(t, es, "POST", "/login")}, {"browse", "capture", "list"}} {
+			if r := e.bcurd(args...); strings.Contains(r.stdout+r.stderr, "horse") {
+				t.Fatalf("login password reached %v:\n%s", args, r)
+			}
+		}
 		// Nothing was hoisted: the mock saw no cookie before the login.
 		rs := e.seen("app.example.com", "/login")
 		if len(rs) == 0 || rs[0].Cookies["session"] != "" {

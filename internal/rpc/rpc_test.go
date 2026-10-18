@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -261,8 +262,10 @@ func TestSocketMode(t *testing.T) {
 		t.Fatalf("dir mode %v", di.Mode().Perm())
 	}
 	ents, _ := os.ReadDir(filepath.Dir(path))
-	if len(ents) != 1 {
-		t.Fatalf("leftover temp entries: %v", ents)
+	for _, e := range ents { // the socket and its lock file only
+		if n := e.Name(); n != filepath.Base(path) && n != filepath.Base(path)+".lock" {
+			t.Fatalf("leftover temp entry %s", n)
+		}
 	}
 }
 
@@ -326,5 +329,62 @@ func TestPeerInfo(t *testing.T) {
 	self, _ := os.Executable()
 	if got.UID != os.Getuid() || got.Exe == "" || got.ParentPID != os.Getppid() || got.ParentExe == "" {
 		t.Fatalf("peer %+v (self %s)", got, self)
+	}
+}
+
+// A second daemon fails on the lock, before it looks at (or replaces) the
+// socket, even when no live socket exists yet.
+func TestSecondServerRefusedByLock(t *testing.T) {
+	path := sockPath(t)
+	os.MkdirAll(filepath.Dir(path), 0o700)
+	l, err := lockFile(path + ".lock")
+	if err != nil || l == nil {
+		t.Skipf("no flock on this platform: %v", err)
+	}
+	// A stale socket file that nobody listens on must survive the refusal.
+	ln, _ := net.Listen("unix", path)
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	ln.Close()
+	before, _ := os.Lstat(path)
+	err = NewServer().Serve(context.Background(), path)
+	if err == nil || !strings.Contains(err.Error(), "another daemon is running") {
+		t.Fatalf("err = %v", err)
+	}
+	after, statErr := os.Lstat(path)
+	if statErr != nil || !os.SameFile(before, after) {
+		t.Fatal("refused daemon touched the socket")
+	}
+	l.Close() // lock released: startup now proceeds and replaces the stale socket
+	start(t, echoServer(), path)
+	if c, err := Dial(path); err != nil {
+		t.Fatal(err)
+	} else {
+		c.Close()
+	}
+}
+
+// On exit the daemon removes only its own socket inode.
+func TestSocketNotRemovedIfReplaced(t *testing.T) {
+	path := sockPath(t)
+	s := echoServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx, path) }()
+	for i := 0; i < 200; i++ {
+		if c, err := Dial(path); err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Someone else replaces the path with a different file.
+	os.Remove(path)
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	<-done
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("daemon removed a socket path it no longer owned: %v", err)
 	}
 }

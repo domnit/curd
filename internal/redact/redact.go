@@ -5,9 +5,15 @@
 package redact
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/domnit/curd/internal/api"
 	"github.com/domnit/curd/internal/creds"
@@ -81,21 +87,97 @@ func (r *Redactor) Add(secrets ...Secret) {
 }
 
 func (r *Redactor) rebuild() {
-	vals := make([]string, 0, len(r.secrets))
+	// Each secret is matched raw and in the encodings it commonly travels
+	// in, so a value shown URL-encoded or JSON-escaped is still caught.
+	forms := map[string]string{}
+	keys := make([]string, 0, len(r.secrets))
 	for v := range r.secrets {
+		keys = append(keys, v)
+	}
+	sort.Strings(keys)
+	for _, v := range keys {
+		ph := r.secrets[v]
+		for _, f := range Variants(v) {
+			if _, ok := forms[f]; !ok {
+				forms[f] = ph
+			}
+		}
+	}
+	// A raw secret always maps to its own placeholder, even if it equals
+	// an encoded form of another secret.
+	for v, ph := range r.secrets {
+		forms[v] = ph
+	}
+	vals := make([]string, 0, len(forms))
+	for v := range forms {
 		vals = append(vals, v)
 	}
 	// Longest first so a secret containing another is replaced whole.
-	sort.Slice(vals, func(i, j int) bool { return len(vals[i]) > len(vals[j]) })
-	var pairs []string
-	for _, v := range vals {
-		pairs = append(pairs, v, r.secrets[v])
-		// Also catch the common URL/JSON-escaped forms.
-		if e := urlEscape(v); e != v {
-			pairs = append(pairs, e, r.secrets[v])
+	sort.Slice(vals, func(i, j int) bool {
+		if len(vals[i]) != len(vals[j]) {
+			return len(vals[i]) > len(vals[j])
 		}
+		return vals[i] < vals[j]
+	})
+	pairs := make([]string, 0, 2*len(vals))
+	for _, v := range vals {
+		pairs = append(pairs, v, forms[v])
 	}
 	r.replacer = strings.NewReplacer(pairs...)
+}
+
+// Variants returns v and the encoded forms a secret value is matched in:
+// URL query and path escaping, full %XX escaping in upper- and lowercase
+// hex, and JSON string escaping (with and without HTML escaping, with "/"
+// as "\/", and with every character as \uXXXX).
+func Variants(v string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(s string) {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	add(v)
+	add(url.QueryEscape(v))
+	add(url.PathEscape(v))
+	add(pctEscapeAll(v, true))
+	add(pctEscapeAll(v, false))
+	for _, j := range jsonForms(v) {
+		add(j)
+		add(strings.ReplaceAll(j, "/", `\/`))
+	}
+	add(jsonUEscapeAll(v, false))
+	add(jsonUEscapeAll(v, true))
+	return out
+}
+
+func jsonForms(v string) []string {
+	var out []string
+	if b, err := json.Marshal(v); err == nil {
+		out = append(out, string(b[1:len(b)-1]))
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(v) == nil {
+		b := bytes.TrimSpace(buf.Bytes())
+		out = append(out, string(b[1:len(b)-1]))
+	}
+	return out
+}
+
+func jsonUEscapeAll(v string, upper bool) string {
+	var b strings.Builder
+	f := "\\u%04x"
+	if upper {
+		f = "\\u%04X"
+	}
+	for _, c := range utf16.Encode([]rune(v)) {
+		fmt.Fprintf(&b, f, c)
+	}
+	return b.String()
 }
 
 // Len reports how many secrets are registered.
@@ -105,7 +187,11 @@ func (r *Redactor) Len() int {
 	return len(r.secrets)
 }
 
-// String redacts s.
+// String redacts s. Encoded forms of each secret are replaced in place. If
+// a secret still shows up after percent-decoding or JSON-unescaping the
+// result (an encoding mixed in a way no listed variant covers), the decoded
+// text is redacted and returned instead: fidelity is given up so that the
+// value never leaks.
 func (r *Redactor) String(s string) string {
 	if r == nil {
 		return s
@@ -116,7 +202,145 @@ func (r *Redactor) String(s string) string {
 	if rep == nil {
 		return s
 	}
-	return rep.Replace(s)
+	out := rep.Replace(s)
+	for range 4 {
+		changed := false
+		for _, dec := range decoders {
+			d := dec(out)
+			if d == out {
+				continue
+			}
+			if rd := rep.Replace(d); rd != d {
+				out, changed = rd, true
+				break
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return out
+}
+
+var decoders = []func(string) string{
+	func(s string) string { return pctDecode(s, false) },
+	func(s string) string { return pctDecode(s, true) },
+	jsonUnescape,
+}
+
+func unhex(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
+// pctDecode decodes valid %XX sequences (and '+' as space when plus is set),
+// leaving anything else as is.
+func pctDecode(s string, plus bool) string {
+	if !strings.Contains(s, "%") && !(plus && strings.Contains(s, "+")) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '%' && i+2 < len(s) {
+			h, ok1 := unhex(s[i+1])
+			l, ok2 := unhex(s[i+2])
+			if ok1 && ok2 {
+				b.WriteByte(h<<4 | l)
+				i += 2
+				continue
+			}
+		}
+		if plus && c == '+' {
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// jsonUnescape decodes JSON string escapes (\/, \", \\, \n..., \uXXXX
+// including surrogate pairs) wherever they appear, leaving anything else as
+// is.
+func jsonUnescape(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c != '\\' || i+1 >= len(s) {
+			b.WriteByte(c)
+			continue
+		}
+		switch e := s[i+1]; e {
+		case '/', '"', '\\':
+			b.WriteByte(e)
+			i++
+		case 'b':
+			b.WriteByte('\b')
+			i++
+		case 'f':
+			b.WriteByte('\f')
+			i++
+		case 'n':
+			b.WriteByte('\n')
+			i++
+		case 'r':
+			b.WriteByte('\r')
+			i++
+		case 't':
+			b.WriteByte('\t')
+			i++
+		case 'u':
+			r1, ok := hex4(s, i+2)
+			if !ok {
+				b.WriteByte(c)
+				continue
+			}
+			i += 5
+			if utf16.IsSurrogate(r1) {
+				if i+6 < len(s) && s[i+1] == '\\' && s[i+2] == 'u' {
+					if r2, ok := hex4(s, i+3); ok {
+						if dr := utf16.DecodeRune(r1, r2); dr != utf8.RuneError {
+							b.WriteRune(dr)
+							i += 6
+							continue
+						}
+					}
+				}
+			}
+			b.WriteRune(r1)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+func hex4(s string, at int) (rune, bool) {
+	if at+4 > len(s) {
+		return 0, false
+	}
+	var r rune
+	for k := 0; k < 4; k++ {
+		h, ok := unhex(s[at+k])
+		if !ok {
+			return 0, false
+		}
+		r = r<<4 | rune(h)
+	}
+	return r, true
 }
 
 // Bytes redacts b.
@@ -189,14 +413,21 @@ func redactSetCookie(v string) string {
 	return out
 }
 
-func urlEscape(s string) string {
+// pctEscapeAll %XX-escapes every byte outside the RFC 3986 unreserved set.
+func pctEscapeAll(s string, upper bool) string {
+	digits := "0123456789abcdef"
+	if upper {
+		digits = "0123456789ABCDEF"
+	}
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("-_.~", c) >= 0 {
 			b.WriteByte(c)
 		} else {
-			b.WriteString("%" + strings.ToUpper(string("0123456789abcdef"[c>>4])+string("0123456789abcdef"[c&15])))
+			b.WriteByte('%')
+			b.WriteByte(digits[c>>4])
+			b.WriteByte(digits[c&15])
 		}
 	}
 	return b.String()

@@ -2,6 +2,7 @@ package consent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -209,5 +210,63 @@ func TestNativeNonDarwin(t *testing.T) {
 	ans, err := NewNative().Ask(context.Background(), Prompt{Kind: KindGrant})
 	if ans != Deny || err == nil {
 		t.Fatalf("%s %v", ans, err)
+	}
+}
+
+func TestApproveDialogShowsEverything(t *testing.T) {
+	var hosts, rules []string
+	for i := 0; i < 30; i++ {
+		hosts = append(hosts, fmt.Sprintf("host%02d.example.com", i))
+		rules = append(rules, fmt.Sprintf("POST ^/api/r%02d$ (write)", i))
+	}
+	s := BuildScript(Prompt{Kind: KindApprovePolicy, Policies: []string{"big"}, Hosts: hosts, Policy: &PolicySummary{
+		Rules:           rules,
+		LocalStorage:    []string{"https://app.example.com authToken -> header Authorization"},
+		Redirects:       "policy-hosts",
+		HeaderAllowlist: []string{"accept", "x-csrf-token"},
+		ExecInspectors:  []string{"/usr/local/bin/check-request"},
+	}})
+	for _, want := range []string{
+		"host00.example.com", "more)", // hosts list marks what it omits
+		"Rules (30):", "POST ^/api/r00$ (write)", "+18 more rules",
+		"Cookies: ALL cookies for these domains",
+		"localStorage: https://app.example.com authToken -> header Authorization",
+		"Request headers allowed: accept, x-csrf-token",
+		"Redirects: policy-hosts",
+		"Runs exec inspector: /usr/local/bin/check-request",
+		"Summary: 30 domains, 30 rules, all cookies, 1 localStorage item, 2 allowlisted headers, 1 exec inspector",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("approve dialog lacks %q:\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "host29.example.com") {
+		t.Errorf("expected host list to be shortened with +K more")
+	}
+	n := BuildScript(Prompt{Kind: KindApprovePolicy, Policies: []string{"p"}, Hosts: []string{"a.com"}, Policy: &PolicySummary{
+		Rules: []string{"GET ^/$ (read)"}, CookiesNone: true, DefaultHeaders: []string{"accept", "content-type"}, Redirects: "none",
+	}})
+	for _, want := range []string{"Cookies: none", "Request headers allowed: default (accept, content-type)", "localStorage: none", "no cookies"} {
+		if !strings.Contains(n, want) {
+			t.Errorf("lacks %q:\n%s", want, n)
+		}
+	}
+	c := BuildScript(Prompt{Kind: KindApprovePolicy, Policies: []string{"p"}, Policy: &PolicySummary{Cookies: []string{"session", "__Host-*"}}})
+	if !strings.Contains(c, "Cookies: session, __Host-*") {
+		t.Errorf("cookie names missing:\n%s", c)
+	}
+}
+
+func TestJoinListMarksOmitted(t *testing.T) {
+	var items []string
+	for i := 0; i < 50; i++ {
+		items = append(items, fmt.Sprintf("item-%02d.example.com", i))
+	}
+	got := joinList(items)
+	if !strings.Contains(got, "more)") {
+		t.Fatalf("list cut without marker: %q", got)
+	}
+	if strings.HasSuffix(got, "...") {
+		t.Fatalf("silent truncation: %q", got)
 	}
 }

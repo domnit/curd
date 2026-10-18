@@ -26,6 +26,7 @@ import (
 	"github.com/domnit/curd/internal/apierr"
 	"github.com/domnit/curd/internal/jar"
 	"github.com/domnit/curd/internal/policy"
+	"github.com/domnit/curd/internal/redact"
 	"github.com/domnit/curd/internal/source"
 )
 
@@ -121,6 +122,26 @@ type Request struct {
 	Method, URL string
 	Headers     []api.Header
 	Body        []byte
+	// Scopes are the scopes the caller's grant holds ("read", "write").
+	// Every redirect hop must be allowed by a rule whose scope is among
+	// them. Empty means read only.
+	Scopes []string
+}
+
+func grantedScopes(s []string) []string {
+	if len(s) == 0 {
+		return []string{policy.ScopeRead}
+	}
+	return s
+}
+
+func hasScope(scopes []string, want string) bool {
+	for _, s := range scopes {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Response is a fetch result. Set-Cookie and the policy's stripped headers
@@ -344,7 +365,8 @@ func (b *Broker) Do(ctx context.Context, p *policy.Policy, req Request) (*Respon
 	if err != nil {
 		return nil, err
 	}
-	resp, err := b.run(ctx, p, e, method, u, kept, req.Body)
+	scopes := grantedScopes(req.Scopes)
+	resp, err := b.run(ctx, p, e, method, u, kept, req.Body, scopes)
 	if err != nil {
 		return nil, err
 	}
@@ -355,7 +377,7 @@ func (b *Broker) Do(ctx context.Context, p *policy.Policy, req Request) (*Respon
 	if err != nil {
 		return nil, err
 	}
-	resp, err = b.run(ctx, p, e, method, u, kept, req.Body)
+	resp, err = b.run(ctx, p, e, method, u, kept, req.Body, scopes)
 	if err != nil {
 		return nil, err
 	}
@@ -370,7 +392,7 @@ func (b *Broker) Do(ctx context.Context, p *policy.Policy, req Request) (*Respon
 func authFailure(s int) bool { return s == http.StatusUnauthorized || s == http.StatusForbidden }
 
 // run executes one full request, following redirects.
-func (b *Broker) run(ctx context.Context, p *policy.Policy, e *source.Entry, method string, u *url.URL, kept []api.Header, body []byte) (*Response, error) {
+func (b *Broker) run(ctx context.Context, p *policy.Policy, e *source.Entry, method string, u *url.URL, kept []api.Header, body []byte, scopes []string) (*Response, error) {
 	cur := u
 	curKept := kept
 	hops := 0
@@ -393,7 +415,7 @@ func (b *Broker) run(ctx context.Context, p *policy.Policy, e *source.Entry, met
 		e.Jar.ApplySetCookie(cur, hresp.Header.Values("Set-Cookie"), b.opts.Now())
 
 		if loc := hresp.Header.Get("Location"); loc != "" && isRedirect(hresp.StatusCode) {
-			next, newMethod, newBody, why := b.nextHop(ctx, p, cur, hresp, method, body, hops)
+			next, newMethod, newBody, why := b.nextHop(ctx, p, cur, hresp, method, body, curKept, hops, scopes)
 			if why == "" {
 				io.Copy(io.Discard, io.LimitReader(hresp.Body, 64<<10))
 				hresp.Body.Close()
@@ -404,14 +426,14 @@ func (b *Broker) run(ctx context.Context, p *policy.Policy, e *source.Entry, met
 				hops++
 				continue
 			}
-			out, err := b.finish(p, cur, hresp, pr, hops)
+			out, err := b.finish(p, e, cur, hresp, pr, hops)
 			if err != nil {
 				return nil, err
 			}
 			out.RedirectBlocked = why
 			return out, nil
 		}
-		return b.finish(p, cur, hresp, pr, hops)
+		return b.finish(p, e, cur, hresp, pr, hops)
 	}
 }
 
@@ -435,7 +457,7 @@ func isRedirect(s int) bool {
 
 // nextHop decides whether to follow a redirect. A non-empty why means it is
 // blocked.
-func (b *Broker) nextHop(ctx context.Context, p *policy.Policy, cur *url.URL, resp *http.Response, method string, body []byte, hops int) (next *url.URL, newMethod string, newBody []byte, why string) {
+func (b *Broker) nextHop(ctx context.Context, p *policy.Policy, cur *url.URL, resp *http.Response, method string, body []byte, kept []api.Header, hops int, scopes []string) (next *url.URL, newMethod string, newBody []byte, why string) {
 	if p.Redirects == policy.RedirectsNone {
 		return nil, "", nil, "policy redirects: none"
 	}
@@ -479,30 +501,50 @@ func (b *Broker) nextHop(ctx context.Context, p *policy.Policy, cur *url.URL, re
 			newBody = nil
 		}
 	}
-	d := p.Check(ctx, policy.CheckRequest{Method: newMethod, URL: next, Body: newBody})
+	if newBody == nil {
+		kept = dropHeader(kept, "Content-Type")
+	}
+	d := p.Check(ctx, policy.CheckRequest{Method: newMethod, URL: next, Headers: kept, Body: newBody})
 	if !d.Allowed {
 		return nil, "", nil, fmt.Sprintf("policy denies redirect target (%s): %s", d.Code, d.Reason)
+	}
+	// The grant authorized the first request only for its own scopes; a
+	// redirect must not escalate a read into a write (for example a 307
+	// that re-sends the body to a write endpoint).
+	scope := d.Scope
+	if scope == "" {
+		scope = policy.ScopeWrite
+	}
+	if !hasScope(scopes, scope) {
+		return nil, "", nil, fmt.Sprintf("redirect target (%s, rule %q) needs %s scope, which the grant does not have", newMethod, d.Rule, scope)
 	}
 	return next, newMethod, newBody, ""
 }
 
 // finish converts an upstream response into a Response.
-func (b *Broker) finish(p *policy.Policy, cur *url.URL, hresp *http.Response, pr prepared, hops int) (*Response, error) {
+func (b *Broker) finish(p *policy.Policy, e *source.Entry, cur *url.URL, hresp *http.Response, pr prepared, hops int) (*Response, error) {
 	defer hresp.Body.Close()
 	max := p.Response.MaxBodyBytes
 	if max <= 0 {
 		max = policy.DefaultResponseMaxBody
 	}
-	data, err := io.ReadAll(io.LimitReader(hresp.Body, max+1))
+	red, pad := b.heldRedactor(e)
+	// Read past the cap by pad bytes so a held value straddling the cap is
+	// redacted whole before the body is cut.
+	data, err := io.ReadAll(io.LimitReader(hresp.Body, max+1+pad))
 	if err != nil {
 		return nil, upstreamErr(cur, err)
 	}
 	out := &Response{
-		Status: hresp.StatusCode, URL: cur.String(), Hops: hops,
+		Status: hresp.StatusCode, URL: red.String(cur.String()), Hops: hops,
 		CookiesSent: pr.cookies, InjectedHeaders: pr.injected,
 	}
+	truncated := int64(len(data)) > max
+	data = red.Bytes(data)
 	if int64(len(data)) > max {
 		data = data[:max]
+	}
+	if truncated {
 		out.Truncated = true
 	}
 	out.Body = p.Redact(data)
@@ -520,10 +562,36 @@ func (b *Broker) finish(p *policy.Policy, cur *url.URL, hresp *http.Response, pr
 			continue
 		}
 		for _, v := range hresp.Header[n] {
-			out.Headers = append(out.Headers, api.Header{Name: n, Value: v})
+			out.Headers = append(out.Headers, api.Header{Name: n, Value: red.String(v)})
 		}
 	}
 	return out, nil
+}
+
+// heldRedactor returns a redactor for the credential values held for the
+// policy (every jar cookie and loaded localStorage value), so an upstream
+// that echoes request headers or cookies cannot hand them to the caller
+// (spec section 12). pad is the length of the longest form it matches.
+func (b *Broker) heldRedactor(e *source.Entry) (*redact.Redactor, int64) {
+	var secrets []redact.Secret
+	if e != nil {
+		if e.Jar != nil {
+			for _, c := range e.Jar.All(b.opts.Now()) {
+				secrets = append(secrets, redact.Secret{Value: c.Value, Placeholder: redact.CookiePlaceholder(c.Name)})
+			}
+		}
+		for _, it := range e.LocalStorage {
+			secrets = append(secrets, redact.Secret{Value: it.Value, Placeholder: redact.LocalStoragePlaceholder(it.Origin, it.Key)})
+		}
+	}
+	var pad int64
+	for _, s := range secrets {
+		// The longest variant (all \uXXXX escapes) is 6 bytes per byte.
+		if n := int64(6 * len(s.Value)); n > pad {
+			pad = n
+		}
+	}
+	return redact.New(secrets...), pad
 }
 
 // upstreamErr maps a transport error to an UpstreamError without echoing the

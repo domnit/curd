@@ -2,6 +2,7 @@ package browser
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -25,9 +26,10 @@ import (
 )
 
 const (
-	secretCookie = "SECRETSESSIONVALUE-abc123"
-	secretLS     = "LSSECRETTOKEN-xyz789"
-	loginCookie  = "MINTEDLOGINCOOKIE-q1w2e3"
+	secretCookie  = "SECRETSESSIONVALUE-abc123"
+	secretLS      = "LSSECRETTOKEN-xyz789"
+	loginCookie   = "MINTEDLOGINCOOKIE-q1w2e3"
+	rotatedCookie = "ROTATEDCOOKIE-r0t4t3d"
 )
 
 type reqRec struct{ Method, Host, Path, Cookie, Body string }
@@ -79,6 +81,8 @@ const appPage = `<!doctype html><html><head><title>Home Page</title></head><body
 <button id="gqlq" onclick="fetch('/graphql',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query:'query Q { me { id } }'})}).then(r=>document.getElementById('out').textContent='gql status '+r.status).catch(e=>document.getElementById('out').textContent='gql failed')">q</button>
 <button id="gqlm" onclick="fetch('/graphql',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query:'mutation M { del(id: 1) { id } }'})}).then(r=>document.getElementById('out').textContent='gql status '+r.status).catch(e=>document.getElementById('out').textContent='gql failed')">m</button>
 <button id="pop" onclick="window.open('/popup')">pop</button>
+<button id="ws" onclick="try{var w=new WebSocket(location.origin.replace('http','ws')+'/wsock');w.onerror=()=>document.getElementById('out').textContent='ws error';w.onopen=()=>document.getElementById('out').textContent='ws open'}catch(e){document.getElementById('out').textContent='ws throw'}">ws</button>
+<button id="wsx" onclick="var n=0,u=location.origin.replace('http','ws')+'/wsock';var f=document.createElement('iframe');document.body.appendChild(f);[WebSocket.prototype.constructor,f.contentWindow.WebSocket].forEach(C=>{try{new C(u).onerror=()=>document.getElementById('out').textContent='ws leaked'}catch(e){n++}});document.getElementById('out').textContent='thrown '+n">wsx</button>
 <a id="toother" href="OTHERURL">other</a>
 <a id="next" href="/p2">next</a>
 <script>
@@ -126,6 +130,19 @@ func newEnv(t *testing.T) *env {
 		case r.URL.Path == "/login":
 			http.SetCookie(w, &http.Cookie{Name: "minted", Value: loginCookie, Path: "/"})
 			fmt.Fprint(w, `<title>Login</title><p id="c">welcome `+loginCookie+`</p>`)
+		case r.URL.Path == "/dataframe":
+			fmt.Fprint(w, `<title>Frames</title><iframe src="data:text/html,<p>framed</p>"></iframe><img src="`+e.base("cdn.example.com")+`/pix">`)
+		case r.URL.Path == "/setcookie":
+			http.SetCookie(w, &http.Cookie{Name: "rot", Value: rotatedCookie, Path: "/"})
+			fmt.Fprint(w, `<title>Rot</title><p id="c">v=`+rotatedCookie+`</p>`)
+		case r.URL.Path == "/loginform" || r.URL.Path == "/sandboxform":
+			if r.URL.Path == "/sandboxform" {
+				w.Header().Set("Content-Security-Policy", "sandbox allow-forms allow-scripts")
+			}
+			fmt.Fprint(w, `<title>Form</title><form method="POST" action="/loginpost"><input id="u" name="user"><input id="pw" type="password" name="pass"><button id="go" type="submit">go</button></form>`)
+		case r.URL.Path == "/loginpost":
+			http.SetCookie(w, &http.Cookie{Name: "minted2", Value: loginCookie, Path: "/"})
+			fmt.Fprint(w, `<title>Posted</title><p id="c">posted</p>`)
 		case r.URL.Path == "/big":
 			fmt.Fprint(w, "<title>Big</title><pre id='b'>"+strings.Repeat("0123456789", 40000)+"</pre>")
 		default:
@@ -174,6 +191,8 @@ type fakeRec struct {
 	mu      sync.Mutex
 	events  map[string]int
 	blocked []blockedRec
+	omitted []string
+	posts   []string // Params of Document POST requestWillBeSent events
 	body    BodyFetcher
 	post    BodyFetcher
 	red     *redact.Redactor
@@ -188,6 +207,15 @@ type blockedRec struct {
 func (f *fakeRec) HandleEvent(sid string, ev cdp.Event) {
 	f.mu.Lock()
 	f.events[ev.Method]++
+	if ev.Method == "Network.requestWillBeSent" && strings.Contains(string(ev.Params), `"method":"POST"`) {
+		f.posts = append(f.posts, string(ev.Params))
+	}
+	f.mu.Unlock()
+}
+
+func (f *fakeRec) OmitRequestBody(id, reason string) {
+	f.mu.Lock()
+	f.omitted = append(f.omitted, id)
 	f.mu.Unlock()
 }
 
@@ -806,5 +834,241 @@ func TestOpenValidation(t *testing.T) {
 	prod := NewManager(Options{HostMap: map[string]string{"a": "127.0.0.1"}})
 	if _, err := prod.Open(context.Background(), OpenSpec{Policies: []*policy.Policy{p}, Seed: SeedLogin}); err == nil {
 		t.Fatal("host_map outside test mode must be refused")
+	}
+}
+
+// ---------------------------------------------------------------- security regressions
+
+func waitBlocked(t *testing.T, h *harness, reason string) blockedRec {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, b := range h.rec.blockedList() {
+			if strings.HasPrefix(b.Reason, reason) {
+				return b
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("no blocked entry with reason %q: %+v", reason, h.rec.blockedList())
+	return blockedRec{}
+}
+
+func TestRedactDataFieldByField(t *testing.T) {
+	// A value the JSON encoder escapes (quote, <, >, &) is invisible to a
+	// redactor run over the marshalled text.
+	const secret = `ab"c<d>&e\f-SECRETVALUE`
+	s := &Session{red: redact.New(redact.Secret{Value: secret, Placeholder: "{cookie:x}"})}
+	type row struct {
+		Title string `json:"title"`
+		N     int64  `json:"n"`
+	}
+	got := s.redactData(map[string]any{
+		"list": []any{"v=" + secret, row{Title: secret, N: 1 << 60}},
+		secret: 1,
+	})
+	b, _ := json.Marshal(got)
+	if strings.Contains(string(b), "SECRETVALUE") || strings.Contains(string(b), `<`) || !strings.Contains(string(b), "{cookie:x}") {
+		t.Fatalf("redactData leaked or lost placeholder: %s", b)
+	}
+	if !strings.Contains(string(b), "1152921504606846976") {
+		t.Fatalf("large integer mangled: %s", b)
+	}
+}
+
+func TestRefusedNavigationSchemes(t *testing.T) {
+	h := newHarness(t)
+	s := h.open(t, OpenSpec{Owner: "sch", Seed: SeedHoist})
+	for _, u := range []string{
+		"data:text/html,<script>document.title=1</script>", "blob:http://app.example.com/x",
+		"javascript:alert(1)", "file:///etc/passwd", "chrome://version", "about:srcdoc",
+	} {
+		if e := doErr(t, s, "open", u); e.Code != apierr.InvalidRequest {
+			t.Errorf("open %q: %v", u, e)
+		}
+		if e := doErr(t, s, "newpage", u); e.Code != apierr.InvalidRequest {
+			t.Errorf("newpage %q: %v", u, e)
+		}
+	}
+	if n := len(do(t, s, "pages").Text); n == 0 {
+		t.Fatal("no pages")
+	}
+	// The interceptor also fails a page-initiated data:/blob: Document.
+	for _, raw := range []string{"data:text/html,<p>x</p>", "blob:http://app.example.com/1", "javascript:1"} {
+		p := &pausedRequest{ResourceType: "Document"}
+		p.Request.URL, p.Request.Method = raw, "GET"
+		if v := s.decide(context.Background(), "", p); v.allow || v.reason != ReasonScheme {
+			t.Errorf("document %q verdict: %+v", raw, v)
+		}
+	}
+	p := &pausedRequest{ResourceType: "Document"}
+	p.Request.URL, p.Request.Method = "about:blank", "GET"
+	if v := s.decide(context.Background(), "", p); !v.allow {
+		t.Errorf("about:blank refused: %+v", v)
+	}
+}
+
+func TestWebSocketBlockedWithoutWriteGrant(t *testing.T) {
+	h := newHarness(t)
+	e := h.env
+	s := h.open(t, OpenSpec{Owner: "ws1", Seed: SeedHoist})
+	do(t, s, "open", e.base("app.example.com")+"/")
+	do(t, s, "click", "#ws")
+	waitText(t, s, "#out", "ws throw")
+	time.Sleep(300 * time.Millisecond)
+	if n := e.hits("app.example.com", "GET", "/wsock"); n != 0 {
+		t.Fatalf("websocket handshake reached the server %d times in a read-only session", n)
+	}
+	waitBlocked(t, h, ReasonWebSocket)
+	// The native constructor is not reachable through the prototype or a
+	// fresh iframe either.
+	do(t, s, "click", "#wsx")
+	waitText(t, s, "#out", "thrown 2")
+	time.Sleep(300 * time.Millisecond)
+	if n := e.hits("app.example.com", "GET", "/wsock"); n != 0 {
+		t.Fatalf("websocket bypass reached the server %d times", n)
+	}
+
+	// With a write grant the handshake goes out (the server here refuses it).
+	s2 := h.open(t, OpenSpec{Owner: "ws2", Seed: SeedHoist, AllowWrites: true})
+	do(t, s2, "open", e.base("app.example.com")+"/")
+	do(t, s2, "click", "#ws")
+	waitText(t, s2, "#out", "ws error")
+	if n := e.hits("app.example.com", "GET", "/wsock"); n == 0 {
+		t.Fatal("websocket handshake should reach the server with write access")
+	}
+}
+
+func TestDomainCookieNotSentToSiblingHost(t *testing.T) {
+	h := newHarness(t)
+	e := h.env
+	e.hostMap["cdn.example.com"] = "127.0.0.1"
+	h.mgr.opts.Load = func(context.Context, *policy.Policy) (*creds.Credentials, error) {
+		return &creds.Credentials{Cookies: []creds.Cookie{
+			{Name: "sid", Value: secretCookie, Domain: ".example.com", Path: "/"},
+		}}, nil
+	}
+	s := h.open(t, OpenSpec{Owner: "dc", Seed: SeedHoist})
+	do(t, s, "open", e.base("app.example.com")+"/")
+	waitText(t, s, "#who", "sid="+redact.CookiePlaceholder("sid")[:0]) // any "sid=" proves the policy host got it
+	if r, ok := e.last("app.example.com", "GET", "/whoami"); !ok || !strings.Contains(r.Cookie, "sid=") {
+		t.Fatalf("policy host did not receive the cookie: %+v", r)
+	}
+	do(t, s, "open", e.base("app.example.com")+"/dataframe")
+	deadline := time.Now().Add(10 * time.Second)
+	for e.hits("cdn.example.com", "GET", "/pix") == 0 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	r, ok := e.last("cdn.example.com", "GET", "/pix")
+	if !ok {
+		t.Fatal("sibling host was never contacted")
+	}
+	if r.Cookie != "" {
+		t.Fatalf("sibling host received a cookie: %q", r.Cookie)
+	}
+}
+
+func TestWildcardDomainCookieDefenseInDepth(t *testing.T) {
+	h := newHarness(t)
+	e := h.env
+	e.hostMap["example.com"] = "127.0.0.1"
+	h.mgr.opts.Load = func(context.Context, *policy.Policy) (*creds.Credentials, error) {
+		return &creds.Credentials{Cookies: []creds.Cookie{
+			{Name: "sid", Value: secretCookie, Domain: ".example.com", Path: "/"},
+		}}, nil
+	}
+	wild := mustPolicy(t, "name: wild\nmatch:\n  hosts: ['*.example.com']\nallow:\n  - methods: [GET]\n    paths: ['^/.*$']\n")
+	s := h.open(t, OpenSpec{Owner: "wc", Seed: SeedHoist, Policies: []*policy.Policy{wild}})
+	do(t, s, "open", e.base("app.example.com")+"/")
+	// The domain cookie also matches the apex example.com, which the policy
+	// does not cover: requests to it are refused rather than sent the cookie.
+	do(t, s, "open", e.base("app.example.com")+"/dataframe") // loads cdn.example.com (a policy host)
+	if _, ok := e.last("example.com", "GET", "/pix"); ok {
+		t.Fatal("apex host contacted")
+	}
+	if s.domainCookieMatches("example.com") != true || s.domainCookieMatches("other.net") {
+		t.Fatalf("domainCookieMatches wrong: %v", s.domainCookies)
+	}
+	p := &pausedRequest{}
+	p.Request.URL, p.Request.Method = e.base("example.com")+"/pix", "GET"
+	p.ResourceType = "Image"
+	if v := s.decide(context.Background(), "", p); v.allow || v.reason != ReasonCookieScope {
+		t.Fatalf("apex subresource verdict: %+v", v)
+	}
+}
+
+func TestHoistRefreshesRedactorFromContext(t *testing.T) {
+	h := newHarness(t)
+	s := h.open(t, OpenSpec{Owner: "rot", Seed: SeedHoist})
+	do(t, s, "open", h.env.base("app.example.com")+"/setcookie")
+	got := do(t, s, "text", "#c").Text
+	if strings.Contains(got, rotatedCookie) || !strings.Contains(got, "{cookie:rot}") {
+		t.Fatalf("server-set cookie not redacted in a hoist session: %q", got)
+	}
+}
+
+func TestLoginPostScopedAndBodyNeverRecorded(t *testing.T) {
+	h := newHarness(t)
+	e := h.env
+	h.mgr.opts.Load = func(context.Context, *policy.Policy) (*creds.Credentials, error) { return nil, nil }
+	s := h.open(t, OpenSpec{Owner: "lp", Seed: SeedLogin, LoginURL: e.base("app.example.com") + "/loginform"})
+	if txt := do(t, s, "login").Text; strings.Contains(txt, "does not see or store") {
+		t.Fatalf("login text makes a false claim: %q", txt)
+	}
+	do(t, s, "type", "#u", "alice")
+	do(t, s, "type", "#pw", "hunter2-PASSWORD")
+	do(t, s, "click", "#go")
+	waitText(t, s, "#c", "posted")
+	if r, ok := e.last("app.example.com", "POST", "/loginpost"); !ok || !strings.Contains(r.Body, "hunter2") {
+		t.Fatalf("login POST not delivered: %+v", r)
+	}
+	if len(h.events("login_post")) != 1 {
+		t.Fatalf("login_post events: %d", len(h.events("login_post")))
+	}
+	h.rec.mu.Lock()
+	omitted, posts := len(h.rec.omitted), append([]string(nil), h.rec.posts...)
+	h.rec.mu.Unlock()
+	if omitted == 0 {
+		t.Fatal("recorder was not asked to omit the login body")
+	}
+	for _, p := range posts {
+		if strings.Contains(p, "hunter2") || strings.Contains(p, `"hasPostData":true`) {
+			t.Fatalf("recorder saw the login body: %s", p)
+		}
+	}
+	// The minted session cookie ends the login phase by itself.
+	deadline := time.Now().Add(10 * time.Second)
+	for s.inLoginPhase() && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if s.inLoginPhase() || len(h.events("login_end")) == 0 {
+		t.Fatal("login phase did not end when a session cookie was minted")
+	}
+	do(t, s, "open", e.base("app.example.com")+"/loginform")
+	doErr(t, s, "click", "#go")
+	waitBlocked(t, h, ReasonPolicyDenied)
+	if n := e.hits("app.example.com", "POST", "/loginpost"); n != 1 {
+		t.Fatalf("form POST after the phase ended: %d", n)
+	}
+	for _, b := range h.rec.blockedList() {
+		if len(b.Req.PostData) != 0 {
+			t.Fatalf("blocked form body recorded: %q", b.Req.PostData)
+		}
+	}
+}
+
+func TestLoginPostRefusesOpaqueOrigin(t *testing.T) {
+	h := newHarness(t)
+	e := h.env
+	h.mgr.opts.Load = func(context.Context, *policy.Policy) (*creds.Credentials, error) { return nil, nil }
+	// A sandboxed page submits with "Origin: null": not a same-origin form.
+	s := h.open(t, OpenSpec{Owner: "lo", Seed: SeedLogin, LoginURL: e.base("app.example.com") + "/sandboxform"})
+	doErr(t, s, "click", "#go")
+	waitBlocked(t, h, ReasonPolicyDenied)
+	if n := e.hits("app.example.com", "POST", "/loginpost"); n != 0 {
+		t.Fatalf("opaque-origin form POST went through: %d", n)
+	}
+	if !s.inLoginPhase() {
+		t.Fatal("phase should still be open")
 	}
 }

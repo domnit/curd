@@ -301,3 +301,43 @@ func TestReplayRequestOmitsPlaceholders(t *testing.T) {
 		t.Fatalf("%s", b)
 	}
 }
+
+func TestDraftNoCookiesIsExplicit(t *testing.T) {
+	p, _, err := Draft("nocookie", []*capture.Entry{{ID: "c1", Method: "GET", URL: "https://app.example.com/api/x", Status: 200,
+		RequestHeaders: h("Accept", "application/json", "X-HTTP-Method-Override", "DELETE")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.Credentials.CookiesNone || len(p.Credentials.Cookies) != 0 {
+		t.Fatalf("credentials %+v", p.Credentials)
+	}
+	if p.CookieNameAllowed("session") {
+		t.Fatal("draft without captured cookies allows all cookies")
+	}
+	for _, a := range p.Request.HeaderAllowlist {
+		if strings.EqualFold(a, "x-http-method-override") {
+			t.Fatalf("method override allowlisted: %v", p.Request.HeaderAllowlist)
+		}
+	}
+	// With cookies captured, the list is used and cookies_none is off.
+	p, _, err = Draft("withcookie", []*capture.Entry{{ID: "c1", Method: "GET", URL: "https://app.example.com/api/x", Status: 200,
+		RequestHeaders: h("Cookie", "session={cookie:session}")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Credentials.CookiesNone || !p.CookieNameAllowed("session") || p.CookieNameAllowed("other") {
+		t.Fatalf("credentials %+v", p.Credentials)
+	}
+}
+
+func TestDraftGraphQLAmbiguousKeysNotQuery(t *testing.T) {
+	p, _, err := Draft("gql", []*capture.Entry{{ID: "c1", Method: "POST", URL: "https://app.example.com/graphql", Status: 200,
+		RequestHeaders: h("Content-Type", "application/json"),
+		RequestBody:    []byte(`{"query":"mutation Del{deleteAll}","QUERY":"query Ok{me}"}`)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := p.Allow[0]; r.Inspect == policy.InspectGraphQLQueryOnly || !r.Disabled || r.Scope != "write" {
+		t.Fatalf("ambiguous GraphQL body drafted as query: %+v", r)
+	}
+}

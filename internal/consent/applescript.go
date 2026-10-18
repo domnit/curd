@@ -59,14 +59,111 @@ func formatDuration(d time.Duration) string {
 	}
 }
 
-func joinList(items []string) string {
+// joinList joins sanitized items within maxListRunes. Items that do not fit
+// are never dropped silently: the list ends with "(+K more)".
+func joinList(items []string) string { return joinListMax(items, maxListRunes, maxFieldRunes) }
+
+func joinListMax(items []string, budget, itemMax int) string {
 	clean := make([]string, 0, len(items))
 	for _, it := range items {
-		if c := sanitize(it, maxFieldRunes); c != "" {
+		if c := sanitize(it, itemMax); c != "" {
 			clean = append(clean, c)
 		}
 	}
-	return sanitize(strings.Join(clean, ", "), maxListRunes)
+	var b strings.Builder
+	n := 0
+	for i, c := range clean {
+		l := len([]rune(c))
+		if i > 0 && n+2+l > budget {
+			fmt.Fprintf(&b, " (+%d more)", len(clean)-i)
+			break
+		}
+		if i > 0 {
+			b.WriteString(", ")
+			n += 2
+		}
+		b.WriteString(c)
+		n += l
+	}
+	return b.String()
+}
+
+// Limits for the approve dialog.
+const (
+	maxRuleLines = 12
+	maxRuleRunes = 120
+	maxPathRunes = 200
+)
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, one)
+	}
+	return fmt.Sprintf("%d %s", n, many)
+}
+
+// policyLines renders a PolicySummary. Long lists show their first entries
+// and "+K more"; a final line gives every count so nothing is hidden.
+func policyLines(name string, hosts []string, ps *PolicySummary) []string {
+	var out []string
+	clean := func(l []string, max int) []string {
+		var r []string
+		for _, x := range l {
+			if c := sanitize(x, max); c != "" {
+				r = append(r, c)
+			}
+		}
+		return r
+	}
+	rules := clean(ps.Rules, maxRuleRunes)
+	out = append(out, fmt.Sprintf("Rules (%d):", len(rules)))
+	for i, r := range rules {
+		if i == maxRuleLines && len(rules) > maxRuleLines+1 {
+			out = append(out, fmt.Sprintf("  ... +%d more rules (see curd policies show %s)", len(rules)-i, sanitize(name, maxFieldRunes)))
+			break
+		}
+		out = append(out, "  - "+r)
+	}
+	switch {
+	case ps.CookiesNone:
+		out = append(out, "Cookies: none")
+	case len(ps.Cookies) == 0:
+		out = append(out, "Cookies: ALL cookies for these domains")
+	default:
+		out = append(out, "Cookies: "+joinList(ps.Cookies))
+	}
+	if len(ps.LocalStorage) == 0 {
+		out = append(out, "localStorage: none")
+	} else {
+		out = append(out, "localStorage: "+joinListMax(ps.LocalStorage, maxListRunes, maxRuleRunes))
+	}
+	if len(ps.HeaderAllowlist) == 0 {
+		out = append(out, "Request headers allowed: default ("+joinList(ps.DefaultHeaders)+")")
+	} else {
+		out = append(out, "Request headers allowed: "+joinList(ps.HeaderAllowlist))
+	}
+	if r := sanitize(ps.Redirects, maxFieldRunes); r != "" {
+		out = append(out, "Redirects: "+r)
+	}
+	for _, e := range clean(ps.ExecInspectors, maxPathRunes) {
+		out = append(out, "Runs exec inspector: "+e)
+	}
+	cookies := "all cookies"
+	switch {
+	case ps.CookiesNone:
+		cookies = "no cookies"
+	case len(ps.Cookies) > 0:
+		cookies = plural(len(ps.Cookies), "cookie pattern", "cookie patterns")
+	}
+	out = append(out, "Summary: "+strings.Join([]string{
+		plural(len(hosts), "domain", "domains"),
+		plural(len(rules), "rule", "rules"),
+		cookies,
+		plural(len(ps.LocalStorage), "localStorage item", "localStorage items"),
+		plural(len(ps.HeaderAllowlist), "allowlisted header", "allowlisted headers"),
+		plural(len(ps.ExecInspectors), "exec inspector", "exec inspectors"),
+	}, ", "))
+	return out
 }
 
 // BuildScript returns the AppleScript source for p. It is pure so it can be
@@ -92,8 +189,32 @@ func BuildScript(p Prompt) string {
 		if l := joinList(p.Hosts); l != "" {
 			lit("Domains: " + l)
 		}
+		if p.Policy != nil {
+			name := ""
+			if len(p.Policies) > 0 {
+				name = p.Policies[0]
+			}
+			for _, l := range policyLines(name, p.Hosts, p.Policy) {
+				lit(l)
+			}
+		}
 		field("Details", p.Detail, maxDetailRunes)
 		field("Purpose", p.Purpose, maxFieldRunes)
+		buttons = `{"Cancel", "Approve"}`
+		cancel, def = "Cancel", "Cancel"
+	case KindShutdown:
+		lit("Stop the curd daemon?")
+		lit("")
+		lit("This ends every grant and browser session.")
+		client := sanitize(p.ClientName, maxFieldRunes)
+		if client == "" {
+			client = "unknown process"
+		}
+		if p.ClientPID > 0 {
+			lit(fmt.Sprintf("Requested by: %s (pid %d)", client, p.ClientPID))
+		} else {
+			lit("Requested by: " + client)
+		}
 		buttons = `{"Cancel", "Approve"}`
 		cancel, def = "Cancel", "Cancel"
 	default:

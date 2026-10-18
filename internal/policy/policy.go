@@ -104,7 +104,10 @@ type Policy struct {
 		Hosts []string `yaml:"hosts"`
 	} `yaml:"match"`
 	Credentials struct {
-		Cookies      []string           `yaml:"cookies,omitempty"`
+		Cookies []string `yaml:"cookies,omitempty"`
+		// CookiesNone says the policy uses no cookies at all. An empty
+		// Cookies list otherwise means "all cookies for matched hosts".
+		CookiesNone  bool               `yaml:"cookies_none,omitempty"`
 		LocalStorage []LocalStorageRule `yaml:"local_storage,omitempty"`
 	} `yaml:"credentials,omitempty"`
 	Allow   []Rule `yaml:"allow"`
@@ -258,6 +261,9 @@ func (p *Policy) validate() error {
 			return fmt.Errorf("credentials.cookies[%d]: invalid glob %q", i, c)
 		}
 	}
+	if p.Credentials.CookiesNone && len(p.Credentials.Cookies) > 0 {
+		return errors.New("credentials: cookies_none: true cannot be combined with a cookies list")
+	}
 	for i := range p.Credentials.LocalStorage {
 		if err := p.Credentials.LocalStorage[i].validate(); err != nil {
 			return fmt.Errorf("credentials.local_storage[%d]: %w", i, err)
@@ -274,6 +280,9 @@ func (p *Policy) validate() error {
 	for i, h := range p.Request.HeaderAllowlist {
 		if !tokenRe.MatchString(h) {
 			return fmt.Errorf("request.header_allowlist[%d]: invalid header name", i)
+		}
+		if methodOverrideHeaders[strings.ToLower(h)] {
+			return fmt.Errorf("request.header_allowlist[%d]: %q is a method-override header and cannot be allowed, since it lets a request allowed as one method act as another", i, h)
 		}
 		if alwaysDropped[strings.ToLower(h)] {
 			p.Warnings = append(p.Warnings, fmt.Sprintf("request.header_allowlist: %q is always dropped and cannot be allowed", h))
@@ -476,8 +485,12 @@ func (p *Policy) MatchesHost(host string) bool {
 }
 
 // CookieNameAllowed reports whether a cookie name passes
-// credentials.cookies; an empty list allows all.
+// credentials.cookies; an empty list allows all, unless cookies_none is set,
+// which allows none.
 func (p *Policy) CookieNameAllowed(name string) bool {
+	if p.Credentials.CookiesNone {
+		return false
+	}
 	if len(p.Credentials.Cookies) == 0 {
 		return true
 	}
@@ -487,6 +500,20 @@ func (p *Policy) CookieNameAllowed(name string) bool {
 		}
 	}
 	return false
+}
+
+// noCookiesPattern is a cookie-name glob that matches no valid cookie name
+// (cookie names are tokens and cannot contain NUL).
+const noCookiesPattern = "\x00no-cookies"
+
+// CookieRequestNames returns the cookie-name globs to request from a
+// credential source: credentials.cookies, or a pattern matching nothing when
+// cookies_none is set (an empty list would mean all cookies).
+func (p *Policy) CookieRequestNames() []string {
+	if p.Credentials.CookiesNone {
+		return []string{noCookiesPattern}
+	}
+	return append([]string(nil), p.Credentials.Cookies...)
 }
 
 // InjectRules returns the localStorage-to-header injections.

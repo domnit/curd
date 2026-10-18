@@ -89,6 +89,10 @@ func TestUserConfigKeychain(t *testing.T) {
 	if uc, err = daemon.LoadUserConfig(dir); err != nil || uc.Keychain != "always-allow" {
 		t.Fatalf("%+v %v", uc, err)
 	}
+	os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("chrome_binary: /opt/x/chrome\n"), 0o600)
+	if uc, err = daemon.LoadUserConfig(dir); err != nil || uc.ChromeBinary != "/opt/x/chrome" {
+		t.Fatalf("chrome_binary: %+v %v", uc, err)
+	}
 	os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("keychain: whenever\n"), 0o600)
 	if _, err = daemon.LoadUserConfig(dir); err == nil {
 		t.Fatal("invalid keychain mode accepted")

@@ -1,6 +1,7 @@
 package redact
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -45,4 +46,48 @@ func TestHeaders(t *testing.T) {
 	if h[0].Value != "a={cookie:a}; b={cookie:b}" || h[1].Value != "a={cookie:a}; Path=/; HttpOnly" || h[2].Value != "Bearer {header:authorization}" || h[3].Value != "*/*" {
 		t.Fatalf("unexpected: %+v", h)
 	}
+}
+
+func TestEncodedVariants(t *testing.T) {
+	const secret = "ab/cd+ef==SECRETTOKEN"
+	r := New(Secret{secret, "{cookie:s}"})
+	inputs := map[string]string{
+		"lowercase pct":      "https://a.com/x?t=ab%2fcd%2bef%3d%3dSECRETTOKEN&n=1",
+		"uppercase pct":      "https://a.com/x?t=ab%2Fcd%2Bef%3D%3DSECRETTOKEN",
+		"mixed-case pct":     "?t=ab%2Fcd%2bef%3D%3dSECRETTOKEN",
+		"partially escaped":  "?t=ab/cd%2Bef==SECRETTOKEN",
+		"json slash":         `{"t":"ab\/cd+ef==SECRETTOKEN"}`,
+		"json html escapes":  `{"t":"ab\/cd+ef==SECRETTOKEN"}`,
+		"json all u escapes": `{"t":"` + uesc(secret, "%04x") + `"}`,
+		"json upper u":       `{"t":"` + uesc(secret, "%04X") + `"}`,
+		"double encoded":     "?t=ab%252Fcd%252Bef%253D%253DSECRETTOKEN",
+	}
+	for name, in := range inputs {
+		if got := r.String(in); strings.Contains(got, "SECRETTOKEN") || strings.Contains(got, "SECRET") {
+			t.Errorf("%s: leak: %s", name, got)
+		}
+	}
+	sp := New(Secret{"has space SECRETTOKEN", "{cookie:sp}"})
+	for _, in := range []string{"q=has+space+SECRETTOKEN", "q=has%20space%20SECRETTOKEN"} {
+		if got := sp.String(in); strings.Contains(got, "SECRETTOKEN") {
+			t.Errorf("space form leak: %s", got)
+		}
+	}
+	html := New(Secret{"a<b>&cSECRETTOKEN", "{cookie:h}"})
+	if got := html.String(`{"v":"a<b>&cSECRETTOKEN"}`); strings.Contains(got, "SECRETTOKEN") {
+		t.Errorf("html-escaped json leak: %s", got)
+	}
+	// Unrelated text with percent signs and escapes is left alone.
+	plain := `{"u":"a%2Fb","s":"x\/y"} 100% done`
+	if got := r.String(plain); got != plain {
+		t.Errorf("unrelated text changed: %s", got)
+	}
+}
+
+func uesc(s, f string) string {
+	var b strings.Builder
+	for _, c := range s {
+		b.WriteString(`\u` + fmt.Sprintf(f, c))
+	}
+	return b.String()
 }

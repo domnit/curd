@@ -4,7 +4,6 @@
 package distill
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -66,6 +65,9 @@ var alwaysDropped = map[string]bool{
 	"te": true, "trailer": true, "upgrade": true, "content-length": true, "transfer-encoding": true,
 }
 
+// Method-override headers are refused in a policy's header_allowlist.
+var methodOverride = map[string]bool{"x-http-method-override": true, "x-http-method": true, "x-method-override": true}
+
 // Browser noise that a script has no reason to send.
 var noiseHeaders = map[string]bool{
 	"user-agent": true, "accept-encoding": true, "origin": true, "referer": true,
@@ -89,23 +91,25 @@ type gqlClass struct {
 }
 
 type gqlItem struct {
-	Query         string          `json:"query"`
-	OperationName string          `json:"operationName"`
-	Extensions    json.RawMessage `json:"extensions"`
+	Query         string
+	OperationName string
+	Extensions    json.RawMessage
 }
 
 func classify(e *capture.Entry, u *url.URL) gqlClass {
 	var c gqlClass
 	pathHint := strings.Contains(strings.ToLower(u.Path), "graphql")
+	// Parse exactly as graphql_query_only does, so a body with duplicate
+	// or case-variant keys (which servers may read differently) is never
+	// classified as a query.
 	var items []gqlItem
-	if b := bytes.TrimSpace(e.RequestBody); len(b) > 0 {
-		if b[0] == '[' {
-			_ = json.Unmarshal(b, &items)
-		} else {
-			var one gqlItem
-			if json.Unmarshal(b, &one) == nil {
-				items = []gqlItem{one}
+	if rs, err := policy.ParseGraphQLRequests(e.RequestBody); err == nil {
+		for _, r := range rs {
+			it := gqlItem{Query: r.Query, Extensions: r.Extensions}
+			if r.OperationName != nil {
+				it.OperationName = *r.OperationName
 			}
+			items = append(items, it)
 		}
 	}
 	hasQuery := false
@@ -158,20 +162,7 @@ func classify(e *capture.Entry, u *url.URL) gqlClass {
 	return c
 }
 
-func persistedHash(ext json.RawMessage) string {
-	if len(ext) == 0 {
-		return ""
-	}
-	var x struct {
-		PersistedQuery struct {
-			Hash string `json:"sha256Hash"`
-		} `json:"persistedQuery"`
-	}
-	if json.Unmarshal(ext, &x) != nil {
-		return ""
-	}
-	return x.PersistedQuery.Hash
-}
+func persistedHash(ext json.RawMessage) string { return policy.PersistedQueryHash(ext) }
 
 func addUnique(l []string, vs ...string) []string {
 	for _, v := range vs {
@@ -275,7 +266,7 @@ func Draft(name string, entries []*capture.Entry) (*policy.Policy, []string, err
 				}
 				continue
 			}
-			if alwaysDropped[l] || isNoise(l) {
+			if alwaysDropped[l] || isNoise(l) || methodOverride[l] {
 				continue
 			}
 			if _, ok := hdrSeen[l]; !ok {
@@ -304,6 +295,9 @@ func Draft(name string, entries []*capture.Entry) (*policy.Policy, []string, err
 		}
 	}
 	p.Credentials.Cookies = cookies
+	// An empty cookies list means "all cookies"; when no request sent any,
+	// the draft says so explicitly.
+	p.Credentials.CookiesNone = len(cookies) == 0
 	for l := range hdrSeen {
 		if hdrUsable[l] {
 			p.Request.HeaderAllowlist = append(p.Request.HeaderAllowlist, l)

@@ -9,6 +9,7 @@ import (
 	"github.com/domnit/curd/internal/api"
 	"github.com/domnit/curd/internal/apierr"
 	"github.com/domnit/curd/internal/audit"
+	"github.com/domnit/curd/internal/consent"
 	"github.com/domnit/curd/internal/rpc"
 )
 
@@ -86,8 +87,27 @@ func (d *Daemon) handleAuditTail(_ context.Context, _ rpc.Peer, raw json.RawMess
 	return api.AuditTailResult{Records: recs}, nil
 }
 
-func (d *Daemon) handleShutdown(_ context.Context, peer rpc.Peer, _ json.RawMessage) (any, error) {
-	d.writeAudit(audit.Record{Event: "shutdown", ClientPID: peer.PID, ClientExe: peer.Exe, Decision: "allow"})
+// handleShutdown stops the daemon. Test mode stops unprompted. Production
+// currently only audits the request (with the caller's pid and exe, tagged
+// "unconfirmed"): a native confirmation needs a new consent.Kind, which the
+// consent package does not have yet. d.cfg.Mode is fixed at startup, so
+// callers cannot pick the path.
+func (d *Daemon) handleShutdown(ctx context.Context, peer rpc.Peer, _ json.RawMessage) (any, error) {
+	rec := audit.Record{Event: "shutdown", ClientPID: peer.PID, ClientExe: peer.Exe, Decision: "allow"}
+	if !d.Test() {
+		// Stopping the daemon lets the caller restart it with a different
+		// environment, so the user confirms it.
+		cl := clientOf(peer)
+		ans, err := d.prompter.Ask(ctx, consent.Prompt{Kind: consent.KindShutdown, ClientName: cl.Name, ClientPID: cl.PID})
+		if err != nil || ans != consent.Approve {
+			rec.Decision, rec.Code = "deny", apierr.DeniedNoGrant
+			d.writeAudit(rec)
+			return nil, apierr.New(apierr.DeniedNoGrant, "the user declined to stop the daemon",
+				"ask the user to stop it, or leave it running; grants and sessions end with it")
+		}
+		d.log.Printf("shutdown confirmed for pid %d (%s)", peer.PID, peer.Exe)
+	}
+	d.writeAudit(rec)
 	// Let the response reach the client before the connections are closed.
 	d.mu.Lock()
 	d.shutdownTimer = time.AfterFunc(100*time.Millisecond, d.Stop)

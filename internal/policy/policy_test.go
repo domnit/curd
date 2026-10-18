@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -120,6 +121,10 @@ func TestParseErrors(t *testing.T) {
 		{"bad origin", base("credentials:\n  local_storage:\n    - origin: a.com\n      keys: [k]\n"), "origin"},
 		{"bad redact", base("response:\n  redact: ['(']\n"), "redact"},
 		{"negative body", base("request:\n  max_body_bytes: -1\n"), "negative"},
+		{"method override header", base("request:\n  header_allowlist: [accept, X-HTTP-Method-Override]\n"), "method-override"},
+		{"x-http-method header", base("request:\n  header_allowlist: [x-http-method]\n"), "method-override"},
+		{"x-method-override header", base("request:\n  header_allowlist: [X-Method-Override]\n"), "method-override"},
+		{"cookies_none with list", base("credentials:\n  cookies_none: true\n  cookies: [a]\n"), "cookies_none"},
 	}
 	for _, tc := range tests {
 		_, err := Parse([]byte(tc.yaml), "")
@@ -394,6 +399,20 @@ func TestGraphQLInspector(t *testing.T) {
 		{"ops allowed", ops, "POST", "/graphql", "application/json", `{"query":"query GetMe { me }"}`, true, ""},
 		{"ops not listed", ops, "POST", "/graphql", "application/json", `{"query":"query Evil { me }"}`, false, "Evil"},
 		{"ops anonymous", ops, "POST", "/graphql", "application/json", `{"query":"{ me }"}`, false, "anonymous"},
+		{"case-variant query key", p, "POST", "/graphql", "application/json", `{"query":"mutation Del{deleteAll}","QUERY":"query Ok{me}"}`, false, "not a valid"},
+		{"case-variant query key first", p, "POST", "/graphql", "application/json", `{"Query":"query Ok{me}","query":"mutation Del{deleteAll}"}`, false, "not a valid"},
+		{"case-variant opname", p, "POST", "/graphql", "application/json", `{"query":"query A{me} mutation B{deleteAll}","operationName":"B","OperationName":"A"}`, false, "not a valid"},
+		{"only case-variant query", p, "POST", "/graphql", "application/json", `{"QUERY":"query Ok{me}"}`, false, "not a valid"},
+		{"duplicate query key", p, "POST", "/graphql", "application/json", `{"query":"mutation Del{deleteAll}","query":"query Ok{me}"}`, false, "not a valid"},
+		{"duplicate opname", p, "POST", "/graphql", "application/json", `{"query":"query A{me} mutation B{x}","operationName":"B","operationName":"A"}`, false, "not a valid"},
+		{"batch case-variant", p, "POST", "/graphql", "application/json", `[{"query":"{a}"},{"query":"mutation{x}","Query":"{b}"}]`, false, "not a valid"},
+		{"case-variant extensions", pp, "POST", "/graphql", "application/json", `{"query":"mutation{x}","Extensions":{"persistedQuery":{"sha256Hash":"` + hash + `"}}}`, false, "not a valid"},
+		{"case-variant persistedQuery", pp, "POST", "/graphql", "application/json", `{"extensions":{"persistedQuery":{"sha256Hash":"` + strings.Repeat("cd", 32) + `"},"PersistedQuery":{"sha256Hash":"` + hash + `"}}}`, false, "not a valid"},
+		{"case-variant sha256Hash", pp, "POST", "/graphql", "application/json", `{"extensions":{"persistedQuery":{"sha256Hash":"` + strings.Repeat("cd", 32) + `","SHA256Hash":"` + hash + `"}}}`, false, "no query text"},
+		{"duplicate nested key", pp, "POST", "/graphql", "application/json", `{"extensions":{"persistedQuery":{"sha256Hash":"` + strings.Repeat("cd", 32) + `","sha256Hash":"` + hash + `"}}}`, false, "not a valid"},
+		{"null opname ok", p, "POST", "/graphql", "application/json", `{"query":"{a}","operationName":null,"variables":{"x":{"y":[1,{"z":2}]}}}`, true, ""},
+		{"GET duplicate query", p, "GET", "/graphql?query=mutation%7Bx%7D&query=%7Bme%7D", "", ``, false, "ambiguous"},
+		{"GET case-variant opname", p, "GET", "/graphql?query=query+A%7Bme%7D+mutation+B%7Bx%7D&operationName=B&OperationName=A", "", ``, false, "ambiguous"},
 		{"ops opname selects", ops, "POST", "/graphql", "application/json", `{"query":"query GetMe { a } query Evil { b }","operationName":"GetMe"}`, true, ""},
 	}
 	for _, tc := range tests {
@@ -583,6 +602,29 @@ func TestInjectRulesAndCookies(t *testing.T) {
 	all := mustParse(t, "name: x\nmatch: {hosts: [a.com]}\nallow:\n  - methods: [GET]\n    paths: ['^/$']\n")
 	if !all.CookieNameAllowed("anything") {
 		t.Error("empty list should allow all")
+	}
+	if got := all.CookieRequestNames(); len(got) != 0 {
+		t.Errorf("CookieRequestNames for all = %q", got)
+	}
+	none := mustParse(t, "name: x\nmatch: {hosts: [a.com]}\ncredentials:\n  cookies_none: true\nallow:\n  - methods: [GET]\n    paths: ['^/$']\n")
+	if none.CookieNameAllowed("anything") || none.CookieNameAllowed("session") {
+		t.Error("cookies_none should allow no cookie")
+	}
+	rn := none.CookieRequestNames()
+	if len(rn) != 1 {
+		t.Fatalf("CookieRequestNames = %q", rn)
+	}
+	for _, n := range []string{"session", "a", "__Host-x", ""} {
+		if ok, _ := path.Match(rn[0], n); ok {
+			t.Errorf("no-cookies pattern matched %q", n)
+		}
+	}
+	out, err := Marshal(none)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back, err := Parse(out, ""); err != nil || !back.Credentials.CookiesNone {
+		t.Errorf("cookies_none did not round-trip: %v\n%s", err, out)
 	}
 }
 

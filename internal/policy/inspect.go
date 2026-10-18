@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -65,13 +66,27 @@ func (GraphQLQueryOnly) Inspect(_ context.Context, req InspectRequest) (bool, st
 
 	// URL parameters (GET style). Inspected even on POST, because some
 	// servers honor them there.
-	if q := req.URL.Query(); q.Has("query") || q.Has("extensions") {
+	q := req.URL.Query()
+	for k, vs := range q {
+		for _, want := range gqlKeys {
+			if strings.EqualFold(k, want) && (k != want || len(vs) > 1) {
+				return false, "URL has ambiguous GraphQL parameter " + strconv.Quote(k), nil
+			}
+		}
+	}
+	if q.Has("query") || q.Has("extensions") {
 		g := gqlRequest{Query: q.Get("query")}
 		if q.Has("operationName") {
 			n := q.Get("operationName")
 			g.OperationName = &n
 		}
 		if e := q.Get("extensions"); e != "" {
+			if checkJSONKeys([]byte(e)) != nil {
+				return false, "URL extensions parameter is not valid", nil
+			}
+			if _, err := exactObject([]byte(e), []string{"persistedQuery"}); err != nil {
+				return false, "URL extensions parameter is not valid", nil
+			}
 			g.Extensions = json.RawMessage(e)
 		}
 		items = append(items, g)
@@ -86,7 +101,7 @@ func (GraphQLQueryOnly) Inspect(_ context.Context, req InspectRequest) (bool, st
 		}
 		if ct == "application/graphql" {
 			g := gqlRequest{Query: string(req.Body)}
-			if n := req.URL.Query().Get("operationName"); n != "" {
+			if n := q.Get("operationName"); n != "" {
 				g.OperationName = &n
 			}
 			items = append(items, g)
@@ -111,21 +126,185 @@ func (GraphQLQueryOnly) Inspect(_ context.Context, req InspectRequest) (bool, st
 
 func parseGQLBody(body []byte) ([]gqlRequest, error) {
 	b := bytes.TrimSpace(body)
+	// encoding/json matches keys case-insensitively and keeps the last of
+	// duplicates, while GraphQL servers read exact-case keys (and may keep
+	// the first duplicate). Refuse anything where those readings could
+	// differ, then read exact keys only.
+	if err := checkJSONKeys(b); err != nil {
+		return nil, err
+	}
 	if b[0] == '[' {
-		var arr []gqlRequest
-		if err := strictJSON(b, &arr); err != nil {
+		var raws []json.RawMessage
+		if err := strictJSON(b, &raws); err != nil {
 			return nil, err
 		}
-		if len(arr) == 0 {
+		if len(raws) == 0 {
 			return nil, errors.New("empty batch")
+		}
+		arr := make([]gqlRequest, 0, len(raws))
+		for _, r := range raws {
+			g, err := decodeGQLObject(r)
+			if err != nil {
+				return nil, err
+			}
+			arr = append(arr, g)
 		}
 		return arr, nil
 	}
-	var one gqlRequest
-	if err := strictJSON(b, &one); err != nil {
+	g, err := decodeGQLObject(b)
+	if err != nil {
 		return nil, err
 	}
-	return []gqlRequest{one}, nil
+	return []gqlRequest{g}, nil
+}
+
+// gqlKeys are the request-object keys a GraphQL server reads.
+var gqlKeys = []string{"query", "operationName", "variables", "extensions"}
+
+// ParseGraphQLRequests decodes a GraphQL-over-HTTP JSON body (one request
+// object or a batch) the way graphql_query_only does: exact-case keys only,
+// and an error for duplicate or case-variant keys that a server might read
+// differently. It returns, per request, the query text, the operation name
+// (nil when absent) and the raw extensions.
+func ParseGraphQLRequests(body []byte) ([]GraphQLRequest, error) {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, errors.New("empty body")
+	}
+	items, err := parseGQLBody(body)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]GraphQLRequest, len(items))
+	for i, it := range items {
+		out[i] = GraphQLRequest(it)
+	}
+	return out, nil
+}
+
+// GraphQLRequest is one decoded GraphQL-over-HTTP request object.
+type GraphQLRequest struct {
+	Query         string
+	OperationName *string
+	Variables     json.RawMessage
+	Extensions    json.RawMessage
+}
+
+// PersistedQueryHash returns extensions.persistedQuery.sha256Hash read with
+// exact-case keys, or "" when absent or ambiguous.
+func PersistedQueryHash(ext json.RawMessage) string { return persistedHash(ext) }
+
+func decodeGQLObject(b []byte) (gqlRequest, error) {
+	var g gqlRequest
+	m, err := exactObject(b, gqlKeys)
+	if err != nil {
+		return g, err
+	}
+	if raw, ok := m["query"]; ok && !isJSONNull(raw) {
+		if err := json.Unmarshal(raw, &g.Query); err != nil {
+			return g, errors.New("query is not a string")
+		}
+	}
+	if raw, ok := m["operationName"]; ok && !isJSONNull(raw) {
+		var n string
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return g, errors.New("operationName is not a string")
+		}
+		g.OperationName = &n
+	}
+	if raw, ok := m["variables"]; ok {
+		g.Variables = raw
+	}
+	if raw, ok := m["extensions"]; ok && !isJSONNull(raw) {
+		if _, err := exactObject(raw, []string{"persistedQuery"}); err != nil {
+			return g, err
+		}
+		g.Extensions = raw
+	}
+	return g, nil
+}
+
+func isJSONNull(raw json.RawMessage) bool { return string(bytes.TrimSpace(raw)) == "null" }
+
+// exactObject decodes a JSON object into a map keyed by exact key text. It
+// fails if a key is a case-variant (but not an exact match) of one of known.
+// Duplicate keys are rejected by checkJSONKeys before this runs.
+func exactObject(b []byte, known []string) (map[string]json.RawMessage, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	if m == nil {
+		return nil, errors.New("not a JSON object")
+	}
+	for k := range m {
+		for _, want := range known {
+			if k != want && strings.EqualFold(k, want) {
+				return nil, fmt.Errorf("ambiguous key %q", k)
+			}
+		}
+	}
+	return m, nil
+}
+
+// checkJSONKeys walks b and fails on any object with a duplicate key.
+func checkJSONKeys(b []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	type frame struct {
+		obj    bool
+		keys   map[string]bool
+		expKey bool
+	}
+	var stack []*frame
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var top *frame
+		if len(stack) > 0 {
+			top = stack[len(stack)-1]
+		}
+		if top != nil && top.obj && top.expKey {
+			if d, ok := tok.(json.Delim); ok && d == '}' {
+				stack = stack[:len(stack)-1]
+				if len(stack) > 0 && stack[len(stack)-1].obj {
+					stack[len(stack)-1].expKey = true
+				}
+				continue
+			}
+			k, ok := tok.(string)
+			if !ok {
+				return errors.New("bad object key")
+			}
+			if top.keys[k] {
+				return fmt.Errorf("duplicate key %q", k)
+			}
+			top.keys[k] = true
+			top.expKey = false
+			continue
+		}
+		switch d := tok.(type) {
+		case json.Delim:
+			switch d {
+			case '{':
+				stack = append(stack, &frame{obj: true, keys: map[string]bool{}, expKey: true})
+				continue
+			case '[':
+				stack = append(stack, &frame{})
+				continue
+			case ']':
+				stack = stack[:len(stack)-1]
+			}
+		}
+		// A value completed; if inside an object, expect the next key.
+		if len(stack) > 0 && stack[len(stack)-1].obj {
+			stack[len(stack)-1].expKey = true
+		}
+	}
 }
 
 func strictJSON(b []byte, v any) error {
@@ -204,18 +383,26 @@ func containsStr(l []string, s string) bool {
 }
 
 func persistedHash(ext json.RawMessage) string {
-	if len(ext) == 0 {
+	if len(ext) == 0 || checkJSONKeys(ext) != nil {
 		return ""
 	}
-	var e struct {
-		PersistedQuery struct {
-			Hash string `json:"sha256Hash"`
-		} `json:"persistedQuery"`
-	}
-	if json.Unmarshal(ext, &e) != nil {
+	e, err := exactObject(ext, []string{"persistedQuery"})
+	if err != nil {
 		return ""
 	}
-	return e.PersistedQuery.Hash
+	pq, ok := e["persistedQuery"]
+	if !ok {
+		return ""
+	}
+	m, err := exactObject(pq, []string{"sha256Hash", "version"})
+	if err != nil {
+		return ""
+	}
+	var h string
+	if raw, ok := m["sha256Hash"]; !ok || json.Unmarshal(raw, &h) != nil {
+		return ""
+	}
+	return h
 }
 
 // ExecInspector runs an external program. It receives JSON

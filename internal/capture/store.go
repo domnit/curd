@@ -5,6 +5,7 @@ package capture
 
 import (
 	"context"
+	"encoding/base64"
 	"net/url"
 	"strings"
 	"sync"
@@ -156,12 +157,30 @@ func (s *Store) view(e *Entry) *Entry {
 	c.ResponseHeaders = red.Headers(e.ResponseHeaders)
 	c.RequestBody = red.Bytes(e.RequestBody)
 	if e.BodyBase64 {
+		// Binary bodies were scanned at capture time; scan again against
+		// secrets learned since.
 		c.ResponseBody = append([]byte(nil), e.ResponseBody...)
+		if d, err := base64.StdEncoding.DecodeString(string(e.ResponseBody)); err != nil || red.Contains(string(d)) {
+			c.ResponseBody, c.BodyTruncated, c.BodyBase64 = []byte(droppedNote), false, false
+		}
 	} else {
 		c.ResponseBody = red.Bytes(e.ResponseBody)
 	}
 	c.Initiator = red.String(e.Initiator)
+	c.StatusText = red.String(e.StatusText)
+	c.MimeType = red.String(e.MimeType)
+	c.Failed = red.String(e.Failed)
+	c.Blocked = red.String(e.Blocked)
 	return &c
+}
+
+// redactor returns the session's redactor (nil if unknown). Caller holds
+// s.mu.
+func (s *Store) redactor(sessionID string) *redact.Redactor {
+	if sd := s.sessions[sessionID]; sd != nil {
+		return sd.red
+	}
+	return nil
 }
 
 func summary(e *Entry) api.CaptureSummary {

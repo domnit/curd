@@ -55,6 +55,11 @@ type Grant struct {
 	IdleTimeout      time.Duration
 	Uses             int
 	Test             bool
+	// Internal grants are minted by the daemon on behalf of something it
+	// owns (a browser session opened under an "allow once" grant). They are
+	// reachable only by id or token, never by session-key matching, so they
+	// cannot widen what the user approved for later requests.
+	Internal bool
 }
 
 func (g *Grant) covers(policy, scope string) (policyOK, scopeOK bool) {
@@ -103,6 +108,7 @@ type MintSpec struct {
 	ClientPID        int
 	ClientExe        string
 	Purpose          string
+	Internal         bool // see Grant.Internal
 }
 
 // Store is a goroutine-safe in-memory grant store.
@@ -216,6 +222,7 @@ func (s *Store) Mint(spec MintSpec) *Grant {
 		ClientPID:        spec.ClientPID,
 		ClientExe:        spec.ClientExe,
 		Purpose:          spec.Purpose,
+		Internal:         spec.Internal,
 		CreatedAt:        now,
 		ExpiresAt:        now.Add(ttl),
 		LastUsed:         now,
@@ -271,7 +278,7 @@ func (s *Store) lookup(token, sessionKey, policy, scope string, now time.Time) (
 	}
 	var best *Grant
 	for _, c := range s.byID {
-		if c.SessionKey != sessionKey {
+		if c.SessionKey != sessionKey || c.Internal {
 			continue
 		}
 		if c.expired(now) {
@@ -371,6 +378,38 @@ func (s *Store) Get(idOrToken string) (*Grant, bool) {
 	s.mu.Unlock()
 	s.notify(dead)
 	return out, out != nil
+}
+
+// Touch marks the live grant with the given id as used now (so an active
+// session does not idle out) without consuming it, counting a use, or
+// matching on session key. It reports whether the grant is still live.
+func (s *Store) Touch(id string) bool {
+	now := s.opts.Now()
+	s.mu.Lock()
+	g := s.byID[id]
+	var dead []*Grant
+	live := false
+	if g != nil {
+		if g.expired(now) {
+			s.removeLocked(g)
+			dead = []*Grant{g}
+		} else {
+			g.LastUsed = now
+			live = true
+		}
+	}
+	s.mu.Unlock()
+	s.notify(dead)
+	return live
+}
+
+// SetPurpose updates the purpose of a live grant.
+func (s *Store) SetPurpose(id, purpose string) {
+	s.mu.Lock()
+	if g := s.byID[id]; g != nil {
+		g.Purpose = purpose
+	}
+	s.mu.Unlock()
 }
 
 // Info converts g to its token-free wire form.
