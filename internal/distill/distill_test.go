@@ -235,8 +235,10 @@ func TestVerifyMinimizeJointRedundancy(t *testing.T) {
 	if err != nil || !res.OK {
 		t.Fatalf("%v %+v", err, res)
 	}
-	if len(narrowed.Request.HeaderAllowlist) != 2 {
-		t.Fatalf("must fall back to full set: %v", narrowed.Request.HeaderAllowlist)
+	// Either header alone suffices, so the narrowest passing set is one of
+	// them, never neither.
+	if got := narrowed.Request.HeaderAllowlist; len(got) != 1 || !reflect.DeepEqual(res.Items[0].NeededHeaders, got) {
+		t.Fatalf("want exactly one of x-a/x-b: allowlist %v, needed %v", got, res.Items[0].NeededHeaders)
 	}
 }
 

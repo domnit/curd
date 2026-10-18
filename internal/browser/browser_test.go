@@ -140,6 +140,12 @@ func newEnv(t *testing.T) *env {
 				w.Header().Set("Content-Security-Policy", "sandbox allow-forms allow-scripts")
 			}
 			fmt.Fprint(w, `<title>Form</title><form method="POST" action="/loginpost"><input id="u" name="user"><input id="pw" type="password" name="pass"><button id="go" type="submit">go</button></form>`)
+		case r.URL.Path == "/anonform":
+			// Like real sites: an anonymous cookie set by script after the
+			// page loaded, then a username step before the password step.
+			fmt.Fprint(w, `<title>Anon</title><script>setTimeout(()=>{document.cookie="anon=ANONYMOUS-COOKIE-1; path=/";document.title="AnonSet"},2500)</script><form method="POST" action="/steptwo"><input id="u" name="user"><button id="go" type="submit">next</button></form>`)
+		case r.URL.Path == "/steptwo":
+			fmt.Fprint(w, `<title>Step two</title><form method="POST" action="/loginpost"><input id="pw" type="password" name="pass"><button id="go2" type="submit">go</button></form>`)
 		case r.URL.Path == "/loginpost":
 			http.SetCookie(w, &http.Cookie{Name: "minted2", Value: loginCookie, Path: "/"})
 			fmt.Fprint(w, `<title>Posted</title><p id="c">posted</p>`)
@@ -1054,6 +1060,44 @@ func TestLoginPostScopedAndBodyNeverRecorded(t *testing.T) {
 		if len(b.Req.PostData) != 0 {
 			t.Fatalf("blocked form body recorded: %q", b.Req.PostData)
 		}
+	}
+}
+
+// Cookies a site sets before the user submits anything (anonymous session,
+// preferences) must not end the login phase, and a multi-step login keeps
+// the phase open until a step mints a new cookie.
+func TestLoginPhaseSurvivesAnonymousCookiesAndSteps(t *testing.T) {
+	h := newHarness(t)
+	e := h.env
+	h.mgr.opts.Load = func(context.Context, *policy.Policy) (*creds.Credentials, error) { return nil, nil }
+	s := h.open(t, OpenSpec{Owner: "la", Seed: SeedLogin, LoginURL: e.base("app.example.com") + "/anonform"})
+	deadline := time.Now().Add(10 * time.Second)
+	for do(t, s, "title").Text != "title: AnonSet" && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	time.Sleep(2500 * time.Millisecond) // let the cookie poll see it
+	if !s.inLoginPhase() {
+		t.Fatal("an anonymous cookie set before any login submission ended the login phase")
+	}
+	do(t, s, "type", "#u", "alice")
+	do(t, s, "click", "#go")
+	waitText(t, s, "title", "Step two")
+	time.Sleep(2500 * time.Millisecond)
+	if !s.inLoginPhase() {
+		t.Fatal("login phase ended after a step that minted no cookie")
+	}
+	do(t, s, "type", "#pw", "hunter2-PASSWORD")
+	do(t, s, "click", "#go2")
+	waitText(t, s, "#c", "posted")
+	if n := e.hits("app.example.com", "POST", "/loginpost"); n != 1 {
+		t.Fatalf("password step not delivered: %d", n)
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for s.inLoginPhase() && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if s.inLoginPhase() {
+		t.Fatal("login phase did not end when the session cookie was minted")
 	}
 }
 

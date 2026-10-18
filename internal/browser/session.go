@@ -47,9 +47,13 @@ type Session struct {
 	// inLoginPhase); zero when there is none.
 	loginUntil time.Time
 	lsScript   string
-	// loginBase is the set of cookies present when the login page loaded;
-	// a cookie outside it ends the login phase (nil until taken).
+	// loginBase is the set of cookies seen before the first login form
+	// submission; sites set anonymous cookies on the login page itself, so
+	// those join the base (nil until taken).
 	loginBase map[string]bool
+	// loginPosted is set once a login form submission was let through. Only
+	// after it does a new credential cookie end the login phase.
+	loginPosted bool
 	// domainCookies lists the domains of seeded domain cookies (lowercase,
 	// no leading dot): non-policy hosts under them are never contacted.
 	domainCookies []string
@@ -544,6 +548,16 @@ func (s *Session) onAttached(ev cdp.Event) {
 		go s.rejectForeign(p.SessionID, ti, p.WaitingForDebugger)
 		return
 	}
+	// A visible browser puts its own WebUI (the omnibox popup and the like)
+	// in the window's context as "browser_ui" targets. They are browser
+	// chrome, not the site: let them run and detach, never close them, and
+	// keep them out of capture and pages. Match the type only: a tab the
+	// user opens (a "page" at chrome://newtab) can navigate to policy hosts
+	// with the seeded cookies, so it stays attached and enforced.
+	if ev.SessionID == "" && ti.Type == "browser_ui" {
+		go s.releaseBrowserUI(p.SessionID, p.WaitingForDebugger)
+		return
+	}
 	// Register before the event loop moves on, so later events for this
 	// session find it.
 	t := &target{sid: p.SessionID, targetID: ti.TargetID, typ: ti.Type}
@@ -554,6 +568,15 @@ func (s *Session) onAttached(ev cdp.Event) {
 	s.targets[p.SessionID] = t
 	s.mu.Unlock()
 	go s.setupTarget(t, p.WaitingForDebugger)
+}
+
+func (s *Session) releaseBrowserUI(sid string, waiting bool) {
+	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+	defer cancel()
+	if waiting {
+		_ = s.call(ctx, sid, "Runtime.runIfWaitingForDebugger", nil, nil)
+	}
+	_ = s.call(ctx, "", "Target.detachFromTarget", map[string]any{"sessionId": sid}, nil)
 }
 
 func (s *Session) rejectForeign(sid string, ti targetInfo, waiting bool) {

@@ -365,6 +365,19 @@ func (b *Broker) Do(ctx context.Context, p *policy.Policy, req Request) (*Respon
 	if err != nil {
 		return nil, err
 	}
+	// With nothing to inject the request would go out anonymous and usually
+	// come back as a 200 login page, which looks like success. Reload once
+	// (the user may have just logged in), then fail with the fix.
+	if e.Empty() {
+		if e, err = b.opts.Sources.Get(ctx, p, true); err != nil {
+			return nil, err
+		}
+		if e.Empty() {
+			return nil, apierr.Newf(apierr.AuthExpired,
+				"log into "+u.Hostname()+" in Chrome, then retry; if the login is in another Chrome profile, pin it with `profile: <name>` in the policy",
+				"no credentials for policy %q were found in Chrome (profile %s): no matching cookies or localStorage keys", p.Name, e.Profile).With("profile", e.Profile)
+		}
+	}
 	scopes := grantedScopes(req.Scopes)
 	resp, err := b.run(ctx, p, e, method, u, kept, req.Body, scopes)
 	if err != nil {

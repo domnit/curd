@@ -35,7 +35,13 @@ type Entry struct {
 	LocalStorage []creds.LocalStorageItem
 	LoadedAt     time.Time
 	Profile      string
+	// SourceCookies counts the cookies loaded from the source, not ones the
+	// jar picked up from Set-Cookie since.
+	SourceCookies int
 }
+
+// Empty reports whether the source had no credentials at all for the policy.
+func (e *Entry) Empty() bool { return e.SourceCookies == 0 && len(e.LocalStorage) == 0 }
 
 type call struct {
 	done  chan struct{}
@@ -140,10 +146,11 @@ func (m *Manager) Get(ctx context.Context, p *policy.Policy, force bool) (*Entry
 		s.jar.SetBase(loaded.Cookies)
 		s.cookies = len(loaded.Cookies)
 		s.entry = &Entry{
-			Jar:          s.jar,
-			LocalStorage: append([]creds.LocalStorageItem(nil), loaded.LocalStorage...),
-			LoadedAt:     m.now(),
-			Profile:      loaded.Profile,
+			Jar:           s.jar,
+			LocalStorage:  append([]creds.LocalStorageItem(nil), loaded.LocalStorage...),
+			LoadedAt:      m.now(),
+			Profile:       loaded.Profile,
+			SourceCookies: len(loaded.Cookies),
 		}
 		s.reqKey = key
 		c.entry = s.entry

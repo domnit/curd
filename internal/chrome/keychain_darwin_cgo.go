@@ -63,6 +63,12 @@ func (keychainProvider) Keys(context.Context) ([][]byte, error) {
 	var buf unsafe.Pointer
 	var n C.size_t
 	if st := C.curd_safe_storage(&buf, &n); st != 0 { // errSecSuccess
+		switch int(st) {
+		case -128: // errSecUserCanceled
+			return nil, fmt.Errorf("%w: the keychain dialog was denied or cancelled", errNoKeychain)
+		case -25300: // errSecItemNotFound
+			return nil, fmt.Errorf("%w: no \"Chrome Safe Storage\" item in the keychain (has Chrome run on this account?)", errNoKeychain)
+		}
 		return nil, fmt.Errorf("%w (Security framework status %d)", errNoKeychain, int(st))
 	}
 	pw := C.GoBytes(buf, C.int(n))

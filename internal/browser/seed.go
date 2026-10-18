@@ -218,9 +218,9 @@ func (s *Session) addSecrets(secrets ...redact.Secret) {
 // refreshRedactor registers the context's current cookie values: in login
 // mode the daemon does not hold the credentials, and in hoist mode the server
 // may rotate or set cookies. The values are used only to redact output and
-// never leave this package. In login mode it also ends the login phase once
-// the context gains a cookie for a policy host that the login page did not
-// already have.
+// never leave this package. In login mode it also ends the login phase once,
+// after a login form submission, the context gains a credential cookie (one
+// the policies allow) that it did not have before that submission.
 func (s *Session) refreshRedactor(ctx context.Context) {
 	if s.isClosed() {
 		return
@@ -252,8 +252,8 @@ func (s *Session) refreshRedactor(ctx context.Context) {
 			continue
 		}
 		s.loginBase[k] = true
-		if !first && s.Seed == SeedLogin && !s.loginUntil.IsZero() &&
-			creds.CookieDomainRelevant(s.PolicyHosts(), c.Domain) {
+		if !first && s.loginPosted && s.Seed == SeedLogin && !s.loginUntil.IsZero() &&
+			s.isSessionCookie(c.Domain, c.Name) {
 			s.loginUntil = time.Time{}
 			ended = true
 		}
@@ -263,6 +263,18 @@ func (s *Session) refreshRedactor(ctx context.Context) {
 	if ended {
 		s.emit(SessionEvent{Type: "login_end", Reason: "session cookie minted"})
 	}
+}
+
+// isSessionCookie reports whether a cookie is one the session's policies
+// would use as a credential: on a policy host and allowed by
+// credentials.cookies.
+func (s *Session) isSessionCookie(domain, name string) bool {
+	for _, p := range s.spec.Policies {
+		if creds.CookieDomainRelevant(p.Match.Hosts, domain) && p.CookieNameAllowed(name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Session) refreshLoop() {

@@ -313,17 +313,24 @@ func (d *Daemon) acquire(ctx context.Context, peer rpc.Peer, p *api.FetchParams,
 // denied is the error for a refused or failed consent prompt.
 func (d *Daemon) denied(pol *policy.Policy, scope string, cause error) error {
 	why := "the user denied access"
+	// After an explicit "no", the hint must not read as "just ask again":
+	// re-prompting a user who declined is the behavior to avoid.
+	declined := "the user declined in the consent dialog; do not retry or re-request unless the user asks you to"
 	if cause != nil {
 		why = "consent could not be obtained: " + cause.Error()
 	}
 	if scope == grants.ScopeWrite {
-		return apierr.Newf(apierr.DeniedMethod,
-			"this request is a write; it needs a write grant: `curd grants request "+pol.Name+" --write`",
-			"%s to write to policy %q", why, pol.Name)
+		hint := "this request is a write; it needs a write grant: `curd grants request " + pol.Name + " --write`"
+		if cause == nil {
+			hint = declined + " (a write needs a write grant: `curd grants request " + pol.Name + " --write`)"
+		}
+		return apierr.Newf(apierr.DeniedMethod, hint, "%s to write to policy %q", why, pol.Name)
 	}
-	return apierr.Newf(apierr.DeniedNoGrant,
-		"ask the user to allow it, then run `curd grants request "+pol.Name+"` or retry the call",
-		"%s to policy %q", why, pol.Name)
+	hint := "ask the user to allow it, then run `curd grants request " + pol.Name + "` or retry the call"
+	if cause == nil {
+		hint = declined + " (then: `curd grants request " + pol.Name + "`)"
+	}
+	return apierr.Newf(apierr.DeniedNoGrant, hint, "%s to policy %q", why, pol.Name)
 }
 
 // askAndMint shows the consent prompt for an implicit (first-use) grant and

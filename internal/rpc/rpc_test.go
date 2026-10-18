@@ -305,8 +305,8 @@ func TestLiveSocketRefused(t *testing.T) {
 }
 
 func TestPeerInfo(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("peer pid details asserted on linux only")
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("peer pid details asserted on linux and darwin only")
 	}
 	path := sockPath(t)
 	start(t, echoServer(), path)

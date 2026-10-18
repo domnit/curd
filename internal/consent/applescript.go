@@ -177,7 +177,7 @@ func BuildScript(p Prompt) string {
 		}
 	}
 
-	var buttons, cancel, def string
+	var buttons, cancel string
 	icon := ""
 	switch p.Kind {
 	case KindApprovePolicy:
@@ -201,7 +201,7 @@ func BuildScript(p Prompt) string {
 		field("Details", p.Detail, maxDetailRunes)
 		field("Purpose", p.Purpose, maxFieldRunes)
 		buttons = `{"Cancel", "Approve"}`
-		cancel, def = "Cancel", "Cancel"
+		cancel = "Cancel"
 	case KindShutdown:
 		lit("Stop the curd daemon?")
 		lit("")
@@ -216,7 +216,7 @@ func BuildScript(p Prompt) string {
 			lit("Requested by: " + client)
 		}
 		buttons = `{"Cancel", "Approve"}`
-		cancel, def = "Cancel", "Cancel"
+		cancel = "Cancel"
 	default:
 		write := p.Scope == "write"
 		if write {
@@ -257,15 +257,17 @@ func BuildScript(p Prompt) string {
 			allow = `"Allow for session"`
 		}
 		buttons = `{"Deny", "Allow once", ` + allow + `}`
-		cancel, def = "Deny", "Deny"
+		cancel = "Deny"
 		if write {
 			icon = " with icon caution"
 		}
 	}
 
 	text := strings.Join(lines, ` & return & `)
-	return fmt.Sprintf(`display dialog %s with title "curd" buttons %s default button %q cancel button %q%s giving up after %d`,
-		text, buttons, def, cancel, icon, giveUpSeconds)
+	// No default button: macOS does not bind Esc to a cancel button that is
+	// also the default, so setting both made Esc do nothing.
+	return fmt.Sprintf(`display dialog %s with title "curd" buttons %s cancel button %q%s giving up after %d`,
+		text, buttons, cancel, icon, giveUpSeconds)
 }
 
 // ParseOutput maps osascript's stdout (for example

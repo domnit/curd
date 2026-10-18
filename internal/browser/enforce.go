@@ -197,6 +197,9 @@ func (s *Session) decide(ctx context.Context, sid string, p *pausedRequest) verd
 		// policy host before any session cookie exists. Fetch/XHR writes stay
 		// blocked; the allowance is audited. The body (it holds the typed
 		// password) is never recorded.
+		s.mu.Lock()
+		s.loginPosted = true
+		s.mu.Unlock()
 		s.emit(SessionEvent{Type: "login_post", Method: method, URL: u.String(), Host: host})
 		s.omitBody(p.NetworkID, "login form submission")
 		return verdict{allow: true}
@@ -286,8 +289,9 @@ func (s *Session) requestBody(ctx context.Context, sid string, p *pausedRequest)
 }
 
 // LoginPhase is how long a login-seeded session lets login form submissions
-// through without a write grant. The phase also ends as soon as the browser
-// gains a session cookie for a policy host, or on `browse login done`.
+// through without a write grant. The phase also ends once a login submission
+// has led to a new credential cookie for a policy host, or on
+// `browse login done`.
 const LoginPhase = 10 * time.Minute
 
 func (s *Session) inLoginPhase() bool {

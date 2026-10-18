@@ -298,7 +298,9 @@ blocked_write: you learn their shape without executing them.`,
 		Short: "List captured requests (id, method, URL, status, type, size, initiator)",
 		Long: `List captured requests, oldest first. Filter with --method, --url-contains,
 --type (Document, XHR, Fetch, Script, ...), --host and --status. Ids (c1, c2,
-...) are what "capture get", "capture export" and "distill draft" take.`,
+...) are what "capture get", "capture export" and "distill draft" take.
+Long URLs are shortened with "…"; "capture get <id>" and --json show them
+in full.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var res api.CaptureListResult
@@ -320,7 +322,7 @@ blocked_write: you learn their shape without executing them.`,
 				if e.Blocked != "" {
 					notes = "blocked: " + e.Blocked + " " + notes
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%d\t%s\t%s\n", e.ID, e.Method, e.Status, e.ResourceType, e.Size, e.URL, notes)
+				fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%d\t%s\t%s\n", e.ID, e.Method, e.Status, e.ResourceType, e.Size, clip(e.URL, maxListURL), notes)
 			}
 			return tw.Flush()
 		},
@@ -525,6 +527,8 @@ request.header_allowlist. The (possibly narrowed) draft is saved back.`,
 					}
 					if len(it.NeededHeaders) > 0 {
 						fmt.Fprintf(out, "    needed headers: %s\n", strings.Join(it.NeededHeaders, ", "))
+					} else if minimize && it.OK && it.Skipped == "" {
+						fmt.Fprintf(out, "    needed headers: none\n")
 					}
 				}
 			}
@@ -537,4 +541,17 @@ request.header_allowlist. The (possibly narrowed) draft is saved back.`,
 	verify.Flags().BoolVar(&minimize, "minimize", false, "drop headers one at a time to find the minimal allowlist")
 	cmd.AddCommand(draft, verify)
 	return cmd
+}
+
+// maxListURL caps the URL column of `capture list`: one data: or long query
+// URL would otherwise pad every row to its width. `capture get` and --json
+// show the full URL.
+const maxListURL = 120
+
+func clip(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
 }

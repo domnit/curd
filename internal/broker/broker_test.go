@@ -608,6 +608,25 @@ func TestAuthExpired(t *testing.T) {
 	}
 }
 
+// With no matching credentials the request would go out anonymous (and
+// usually come back as a 200 login page). It must not be sent at all.
+func TestNoCredentialsNotSent(t *testing.T) {
+	e := newEnv(t)
+	e.static = &source.StaticFile{}
+	b, m := e.broker(true)
+	_, err := e.do(b, pol(t), "GET", e.url("app.example.com", "/x"), nil, "")
+	ae := apierr.As(err)
+	if ae.Code != apierr.AuthExpired || !strings.Contains(ae.Hint, "log into app.example.com in Chrome") {
+		t.Fatalf("%v", err)
+	}
+	if len(e.recs()) != 0 {
+		t.Fatalf("an uncredentialed request was sent: %d", len(e.recs()))
+	}
+	if m.Loads("dash") != 2 {
+		t.Fatalf("want one reload before giving up, loads=%d", m.Loads("dash"))
+	}
+}
+
 func TestRetryResendsBody(t *testing.T) {
 	e := newEnv(t)
 	b, _ := e.broker(true)

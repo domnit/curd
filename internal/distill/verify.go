@@ -175,16 +175,32 @@ func Verify(ctx context.Context, draft *policy.Policy, entries []*capture.Entry,
 				testedHdr[strings.ToLower(h.Name)] = true
 			}
 		}
+		// Greedy elimination: drop one header at a time from what is still
+		// kept and keep it dropped if the replay still matches. Each step is
+		// confirmed against the narrowed set, so headers that are redundant
+		// only jointly (either one suffices) still narrow to one of them.
 		for _, v := range oks {
-			for i, h := range v.sent {
-				without := append(append([]api.Header(nil), v.sent[:i]...), v.sent[i+1:]...)
+			cur := append([]api.Header(nil), v.sent...)
+			for _, h := range v.sent {
+				var without []api.Header
+				for _, k := range cur {
+					if !strings.EqualFold(k.Name, h.Name) {
+						without = append(without, k)
+					}
+				}
+				if len(without) == len(cur) {
+					continue
+				}
 				ok, err := passes(ctx, rep, work, v.e, without)
 				if err != nil {
 					return nil, nil, err
 				}
-				if !ok {
-					v.needed[strings.ToLower(h.Name)] = true
+				if ok {
+					cur = without
 				}
+			}
+			for _, k := range cur {
+				v.needed[strings.ToLower(k.Name)] = true
 			}
 		}
 		final := map[string]bool{}
@@ -196,26 +212,6 @@ func Verify(ctx context.Context, draft *policy.Policy, entries []*capture.Entry,
 		for _, v := range oks {
 			for n := range v.needed {
 				final[n] = true
-			}
-		}
-		// Removing headers one at a time does not prove removing them all
-		// together is safe, so confirm with exactly the narrowed set.
-		for _, v := range oks {
-			var subset []api.Header
-			for _, h := range v.sent {
-				if v.needed[strings.ToLower(h.Name)] {
-					subset = append(subset, h)
-				}
-			}
-			ok, err := passes(ctx, rep, work, v.e, subset)
-			if err != nil {
-				return nil, nil, err
-			}
-			if !ok {
-				for _, h := range v.sent {
-					v.needed[strings.ToLower(h.Name)] = true
-					final[strings.ToLower(h.Name)] = true
-				}
 			}
 		}
 		var allow []string

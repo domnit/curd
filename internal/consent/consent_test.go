@@ -57,10 +57,14 @@ func TestScriptContents(t *testing.T) {
 	w := BuildScript(Prompt{Kind: KindGrant, Policies: []string{"gh"}, Hosts: []string{"github.com"}, Scope: "write",
 		ClientName: "claude", ClientPID: 7, Duration: 90 * time.Minute, SessionKey: "chat1", Purpose: "do it", Detail: "POST /x (4 bytes)"})
 	for _, want := range []string{"github.com", "gh", "claude (pid 7)", "Scope: WRITE", "WARNING", `{"Deny", "Allow once", "Allow for 1h30m"}`,
-		`default button "Deny"`, `cancel button "Deny"`, "with icon caution", "giving up after 300", "chat1", "do it", "POST /x"} {
+		`cancel button "Deny"`, "with icon caution", "giving up after 300", "chat1", "do it", "POST /x"} {
 		if !strings.Contains(w, want) {
 			t.Errorf("missing %q in %s", want, w)
 		}
+	}
+	// Esc maps to the cancel button only when it is not also the default.
+	if strings.Contains(w, "default button") {
+		t.Errorf("dialog sets a default button, which breaks Esc: %s", w)
 	}
 	r := BuildScript(Prompt{Kind: KindGrant, Scope: "read", Duration: time.Hour})
 	if strings.Contains(r, "caution") || strings.Contains(r, "WARNING") || !strings.Contains(r, "Scope: read") {
