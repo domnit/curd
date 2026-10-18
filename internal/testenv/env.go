@@ -327,12 +327,20 @@ func Run(ctx context.Context, o UpOptions, argv []string, stdin io.Reader, stdou
 			return 1, fmt.Errorf("run %s: %w", argv[0], err)
 		}
 	}
-	if res, err := ConsentFailures(env.Socket); err == nil && len(res.Failures) > 0 {
-		fmt.Fprintln(stderr, "curd: test-env: the consent script was violated:")
-		for _, f := range res.Failures {
-			fmt.Fprintln(stderr, "  - "+f)
+	if res, err := ConsentFailures(env.Socket); err == nil {
+		if len(res.Failures) > 0 {
+			fmt.Fprintln(stderr, "curd: test-env: the consent script was violated:")
+			for _, f := range res.Failures {
+				fmt.Fprintln(stderr, "  - "+f)
+			}
 		}
-		if code == 0 {
+		if len(res.Leaks) > 0 {
+			fmt.Fprintln(stderr, "curd: test-env: a credential leaked into a browser profile (spec 9.4):")
+			for _, f := range res.Leaks {
+				fmt.Fprintln(stderr, "  - "+f)
+			}
+		}
+		if (len(res.Failures) > 0 || len(res.Leaks) > 0) && code == 0 {
 			code = 1
 		}
 	}

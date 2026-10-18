@@ -39,7 +39,8 @@ document.getElementById('save').addEventListener('click', () => {
   fetch('/api/settings', {method: 'POST',
     headers: {'X-CSRF-Token': token, 'Content-Type': 'application/json'},
     body: JSON.stringify({theme: 'dark'})})
-  .then(r => r.text().then(t => { document.getElementById('result').textContent = r.status + ' ' + t; }));
+  .then(r => r.text().then(t => { document.getElementById('result').textContent = r.status + ' ' + t; }))
+  .catch(e => { document.getElementById('result').textContent = 'failed: ' + e; });
 });
 </script></body></html>`
 

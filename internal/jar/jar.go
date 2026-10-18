@@ -247,6 +247,44 @@ func (j *Jar) CookiesFor(u *url.URL, now time.Time) []creds.Cookie {
 	return out
 }
 
+// All returns every unexpired cookie, overlay cookies replacing base cookies
+// of the same (name, domain, path) and deleted base cookies masked. It is for
+// seeding a browser with exactly the cookies the fetch broker would use.
+// Order is by domain, path, then name.
+func (j *Jar) All(now time.Time) []creds.Cookie {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var out []creds.Cookie
+	live := func(c creds.Cookie) bool { return c.Expires.IsZero() || c.Expires.After(now) }
+	for _, c := range j.overlay {
+		if live(c) {
+			out = append(out, c)
+		}
+	}
+	for k, c := range j.base {
+		if _, ok := j.overlay[k]; ok {
+			continue
+		}
+		if t, ok := j.deleted[k]; ok && !c.LastUpdate.After(t) {
+			continue
+		}
+		if live(c) {
+			out = append(out, c)
+		}
+	}
+	sort.Slice(out, func(a, b int) bool {
+		x, y := out[a], out[b]
+		if x.Domain != y.Domain {
+			return x.Domain < y.Domain
+		}
+		if x.Path != y.Path {
+			return x.Path < y.Path
+		}
+		return x.Name < y.Name
+	})
+	return out
+}
+
 // CookieHeader renders cookies as a Cookie request header value.
 func CookieHeader(cs []creds.Cookie) string {
 	var b strings.Builder

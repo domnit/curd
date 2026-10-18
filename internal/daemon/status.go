@@ -20,6 +20,10 @@ const MethodTestConsentFailures = "test.consent_failures"
 type ConsentFailuresResult struct {
 	Failures  []string `json:"failures"`
 	Remaining int      `json:"remaining"` // scripted prompts never asked
+	// Leaks lists browser-profile assertion failures (spec 9.4): an injected
+	// credential found in a session's profile. Asking closes every open
+	// browser session first so their profiles are scanned.
+	Leaks []string `json:"leaks"`
 }
 
 func (d *Daemon) registerBuiltins() {
@@ -29,32 +33,20 @@ func (d *Daemon) registerBuiltins() {
 	d.register(api.MethodStatus, d.handleStatus)
 	d.register(api.MethodAuditTail, d.handleAuditTail)
 	d.register(api.MethodShutdown, d.handleShutdown)
-	d.registerNotAvailable()
+	d.registerBrowser()
 	if d.scripted != nil {
-		d.register(MethodTestConsentFailures, func(context.Context, rpc.Peer, json.RawMessage) (any, error) {
+		d.register(MethodTestConsentFailures, func(ctx context.Context, _ rpc.Peer, _ json.RawMessage) (any, error) {
 			f := d.scripted.Failures()
 			if f == nil {
 				f = []string{}
 			}
-			return ConsentFailuresResult{Failures: f, Remaining: d.scripted.Remaining()}, nil
+			d.bs.mgr.CloseAll(ctx)
+			leaks := d.bs.mgr.LeakFindings()
+			if leaks == nil {
+				leaks = []string{}
+			}
+			return ConsentFailuresResult{Failures: f, Remaining: d.scripted.Remaining(), Leaks: leaks}, nil
 		})
-	}
-}
-
-// registerNotAvailable installs placeholders for the methods that will be
-// replaced when browser sessions, capture and distill are wired. Register
-// overrides them.
-func (d *Daemon) registerNotAvailable() {
-	na := func(context.Context, rpc.Peer, json.RawMessage) (any, error) {
-		return nil, apierr.New(apierr.NotAvailable, "browser sessions are not wired yet",
-			"use `curd fetch` for brokered requests; browser sessions, capture and distill are coming")
-	}
-	for _, m := range []string{
-		api.MethodOpenSession, api.MethodCloseSession, api.MethodBrowse,
-		api.MethodCaptureList, api.MethodCaptureGet, api.MethodCaptureFind, api.MethodCaptureExport,
-		api.MethodDistillDraft, api.MethodDistillVerify,
-	} {
-		d.register(m, na)
 	}
 }
 

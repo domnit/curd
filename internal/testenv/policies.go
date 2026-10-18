@@ -16,12 +16,15 @@ import (
 // They double as documentation of what a policy looks like.
 func Policies(tlsPort int) map[string]string {
 	p := map[string]string{}
-	p["app.yaml"] = `# The mock "app" site: cookie-authenticated, read-only by default.
+	p["app.yaml"] = fmt.Sprintf(`# The mock "app" site: cookie-authenticated, read-only by default.
 name: app
 match:
   hosts: [app.example.com]
 credentials:
   cookies: [session]            # only the session cookie is ever sent
+  local_storage:                # no inject_as: only seeded into browser sessions, never sent by fetch
+    - origin: https://app.example.com:%d
+      keys: [authToken]
 allow:
   - methods: [GET, HEAD]        # read scope
     paths:
@@ -36,7 +39,7 @@ redirects: same-host-only       # never follow a redirect to another host
 ttl_default: 8h
 test:
   host_map: {app.example.com: 127.0.0.1}
-`
+`, tlsPort)
 	p["api.yaml"] = fmt.Sprintf(`# The mock "api" site: authenticates with a bearer token that lives in the
 # localStorage for the api origin (inject_as builds the Authorization header
 # server-side; injection is scoped to that origin).

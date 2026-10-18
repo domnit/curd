@@ -29,25 +29,43 @@ Sessions end at their TTL, on "curd session close", or when their grant is
 revoked.`,
 	}
 	var ttl, seed, loginURL string
-	var write, explore bool
+	var write, explore, login, hoist bool
 	open := &cobra.Command{
-		Use:   "open <policy>... [--ttl 30m] [--write]",
+		Use:   "open <policy>... [--ttl 30m] [--write] [--login [--login-url URL] | --hoist] [--explore]",
 		Short: "Start a browser session for one or more policies",
-		Long: `Start the session and print its id and expiry. Later "curd browse" calls use the
-most recent session unless you pass --session <id>.
+		Long: `Start the session and print its id, seed and expiry. Later "curd browse" calls
+use your most recent session unless you pass --session <id>.
 
-  --ttl        session lifetime, e.g. 30m (default: short)
+  --ttl        session lifetime, e.g. 30m (default 30m, never longer than the grant)
   --write      allow writes the page makes (also needs a write grant); use only
                on a throwaway account or workspace
-  --seed       how the browser gets its login: "hoist" copies the Chrome
-               profile's cookies/localStorage for the policies into the
-               in-memory browser context; "login" starts logged out and lets the
-               user sign in interactively (nothing is copied)
-  --login-url  first page for interactive login
+  --hoist      log the browser in by copying the policy's cookies and
+               localStorage from the Chrome profile into the in-memory browser
+               context (the default when the profile has any for the policies)
+  --login      start logged out and sign in through the browser yourself:
+               "curd browse open <login url>", "curd browse type <sel> <text>",
+               "curd browse click <sel>". Nothing is copied. The default when
+               the profile holds nothing for the policies
+  --login-url  first page for --login (default: https://<first policy host>/)
   --explore    tag the audit records "explore" (the session is for capturing
-               a site's API)`,
+               a site's API)
+
+Opening a session asks for a grant like "curd fetch" does and may print a token
+(pass it as CURD_TOKEN to reuse the grant elsewhere). The exploration loop is
+open -> browse -> "curd browse capture list" -> "curd distill draft" ->
+"curd distill verify" -> "curd policies approve"; keep the session open until
+the draft is verified: closing it deletes the capture.`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if login && hoist || (login || hoist) && seed != "" {
+				return fmt.Errorf("choose one of --login, --hoist and --seed")
+			}
+			switch {
+			case login:
+				seed = "login"
+			case hoist:
+				seed = "hoist"
+			}
 			p := api.OpenSessionParams{
 				Caller: g.caller(), Policies: args, TTL: ttl, AllowWrites: write,
 				Seed: seed, LoginURL: loginURL, Explore: explore,
@@ -59,22 +77,29 @@ most recent session unless you pass --session <id>.
 			if g.json {
 				return writeJSON(cmd.OutOrStdout(), res)
 			}
+			errw := cmd.ErrOrStderr()
 			if res.NewToken != "" {
-				fmt.Fprintf(cmd.ErrOrStderr(), "curd: granted access (token: %s)\n", res.NewToken)
+				fmt.Fprintf(errw, "curd: granted access to %s. token: %s\n", strings.Join(args, ", "), res.NewToken)
+				fmt.Fprintf(errw, "curd: later calls in this session reuse the grant automatically; to share it with another process pass it as CURD_TOKEN=%s or --token\n", res.NewToken)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%s (expires %s, seed %s)\n", res.SessionID, fmtTime(res.ExpiresAt), res.Seed)
+			if res.Seed == "login" {
+				fmt.Fprintln(errw, "curd: the browser starts logged out; sign in with `curd browse open <login url>`, `curd browse type <selector> <text>` and `curd browse click <selector>` (nothing is copied from Chrome)")
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "%s (seed %s, expires %s)\n", res.SessionID, res.Seed, fmtTime(res.ExpiresAt))
 			return nil
 		},
 	}
-	open.Flags().StringVar(&ttl, "ttl", "", "session lifetime such as 30m")
+	open.Flags().StringVar(&ttl, "ttl", "", "session lifetime such as 30m (default 30m)")
 	open.Flags().BoolVar(&write, "write", false, "let the page's writes through (needs a write grant)")
-	open.Flags().StringVar(&seed, "seed", "", "login method: hoist or login")
-	open.Flags().StringVar(&loginURL, "login-url", "", "first page for interactive login")
+	open.Flags().BoolVar(&login, "login", false, "start logged out; sign in interactively through the browser")
+	open.Flags().BoolVar(&hoist, "hoist", false, "seed the browser from the Chrome profile's cookies/localStorage")
+	open.Flags().StringVar(&seed, "seed", "", "same as --login / --hoist: \"login\" or \"hoist\"")
+	open.Flags().StringVar(&loginURL, "login-url", "", "first page for --login")
 	open.Flags().BoolVar(&explore, "explore", false, "tag audit records as exploration")
 	closeCmd := &cobra.Command{
 		Use:   "close [session-id]",
 		Short: "Close a browser session and delete its temporary profile",
-		Long:  `Close the given session, or the most recent one if no id is given. The browser process is killed and its temporary profile and captured traffic are deleted.`,
+		Long:  `Close the given session, or your most recent one if no id is given. The browser process is killed and its temporary profile and captured traffic are deleted, so verify any draft ("curd distill verify") first.`,
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p := api.CloseSessionParams{Caller: g.caller()}
@@ -90,7 +115,40 @@ most recent session unless you pass --session <id>.
 			return nil
 		},
 	}
-	cmd.AddCommand(open, closeCmd)
+	ls := &cobra.Command{
+		Use:   "ls",
+		Short: "List your open browser sessions",
+		Long:  `List the browser sessions you may use: id, policies, seed, flags and expiry. The most recent one is the default for "curd browse".`,
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var res api.SessionsListResult
+			if err := g.call(cmd.Context(), api.MethodSessionsList, api.SessionsListParams{Caller: g.caller()}, &res); err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			if g.json {
+				return writeJSON(out, res)
+			}
+			if len(res.Sessions) == 0 {
+				fmt.Fprintln(out, "no open sessions; start one with `curd session open <policy>`")
+				return nil
+			}
+			tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(tw, "ID\tPOLICIES\tSEED\tFLAGS\tEXPIRES")
+			for _, s := range res.Sessions {
+				var flags []string
+				if s.Write {
+					flags = append(flags, "write")
+				}
+				if s.Explore {
+					flags = append(flags, "explore")
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", s.SessionID, strings.Join(s.Policies, ","), s.Seed, strings.Join(flags, ","), fmtTime(s.ExpiresAt))
+			}
+			return tw.Flush()
+		},
+	}
+	cmd.AddCommand(open, closeCmd, ls)
 	return cmd
 }
 

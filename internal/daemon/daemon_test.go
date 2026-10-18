@@ -339,8 +339,13 @@ func TestGrantsRequestListRevoke(t *testing.T) {
 	if !strings.Contains(ae.Hint, "post-v1") {
 		t.Fatalf("%v", ae)
 	}
-	for _, m := range []string{api.MethodOpenSession, api.MethodBrowse, api.MethodCaptureList, api.MethodDistillDraft} {
-		wantCode(t, e.cl.Call(context.Background(), m, map[string]string{}, nil), apierr.NotAvailable)
+	// Browser sessions, capture and distill are wired: with empty params they
+	// reject the request instead of answering not_available.
+	for m, want := range map[string]string{
+		api.MethodOpenSession: apierr.InvalidRequest, api.MethodBrowse: apierr.InvalidRequest,
+		api.MethodCaptureList: apierr.NotFound, api.MethodDistillDraft: apierr.InvalidRequest,
+	} {
+		wantCode(t, e.cl.Call(context.Background(), m, map[string]string{}, nil), want)
 	}
 }
 

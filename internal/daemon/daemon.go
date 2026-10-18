@@ -3,8 +3,8 @@
 // and the audit log (spec sections 4 to 12 and 15).
 //
 // Method handlers live in separate files (fetch.go, grants.go, policies.go,
-// status.go). Components that are wired later (browser sessions, capture,
-// distill) plug in through Register, OnShutdown and OnGrantRevoked.
+// status.go, browser.go, distill.go). Other components can plug in through
+// Register, OnShutdown and OnGrantRevoked.
 package daemon
 
 import (
@@ -52,6 +52,7 @@ type Daemon struct {
 	userAgent string
 
 	prompts promptGroup
+	bs      *browserState // browser sessions, capture and drafts
 
 	mu            sync.Mutex
 	onShutdown    []func()

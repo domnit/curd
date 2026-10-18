@@ -210,8 +210,15 @@ func (s *Session) start(ctx context.Context) error {
 
 	args := []string{"--disable-features=BackForwardCache", "--disable-extensions"}
 	if o.Test {
-		var rules []string
+		hm := map[string]string{}
 		for h, ip := range o.HostMap {
+			hm[h] = ip
+		}
+		for h, ip := range s.spec.HostMap {
+			hm[h] = ip
+		}
+		var rules []string
+		for h, ip := range hm {
 			rules = append(rules, "MAP "+h+" "+ip)
 		}
 		sortStrings(rules)

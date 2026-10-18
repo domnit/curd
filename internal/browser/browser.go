@@ -109,6 +109,9 @@ type OpenSpec struct {
 	Seed        string // "hoist" | "login"
 	LoginURL    string
 	Explore     bool
+	// HostMap adds to Options.HostMap for this session (test mode only); the
+	// daemon passes the union of the session policies' test.host_map.
+	HostMap map[string]string
 }
 
 // Manager owns the live sessions.
@@ -161,7 +164,7 @@ func (m *Manager) Open(ctx context.Context, spec OpenSpec) (*Session, error) {
 	if spec.Seed == SeedHoist && m.opts.Load == nil {
 		return nil, apierr.New(apierr.Internal, "no credential loader configured for hoist sessions", "use seed login, or configure a credential source")
 	}
-	if len(m.opts.HostMap) > 0 && !m.opts.Test {
+	if (len(m.opts.HostMap) > 0 || len(spec.HostMap) > 0) && !m.opts.Test {
 		return nil, apierr.New(apierr.Internal, "host_map is refused outside test mode", "")
 	}
 	if spec.TTL <= 0 {

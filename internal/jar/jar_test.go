@@ -274,3 +274,28 @@ func TestPortIgnoredAndCase(t *testing.T) {
 		t.Errorf("got %v", got)
 	}
 }
+
+func TestAll(t *testing.T) {
+	j := New()
+	j.SetBase([]creds.Cookie{
+		{Name: "session", Value: "old", Domain: "app.example.com", Path: "/", LastUpdate: t0.Add(-time.Hour)},
+		{Name: "gone", Value: "g", Domain: "app.example.com", Path: "/", LastUpdate: t0.Add(-time.Hour)},
+		{Name: "stale", Value: "s", Domain: "app.example.com", Path: "/", Expires: t0.Add(-time.Minute)},
+		{Name: "wide", Value: "w", Domain: ".example.com", Path: "/a", Expires: t0.Add(time.Hour)},
+	})
+	u := mustURL(t, "https://app.example.com/")
+	j.ApplySetCookie(u, []string{"session=new; Path=/", "gone=; Max-Age=-1; Path=/", "fresh=f; Path=/x"}, t0)
+
+	got := j.All(t0)
+	var have []string
+	for _, c := range got {
+		have = append(have, c.Name+"="+c.Value)
+	}
+	want := []string{"wide=w", "session=new", "fresh=f"} // by domain (".example.com" first), path, name
+	if !eq(have, want) {
+		t.Fatalf("All = %v, want %v", have, want)
+	}
+	if got := j.All(t0.Add(2 * time.Hour)); len(got) != 2 { // wide expired; session cookies stay
+		t.Fatalf("after expiry: %d cookies, want 2", len(got))
+	}
+}

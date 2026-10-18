@@ -21,6 +21,7 @@ const (
 	MethodAuditTail     = "audit.tail"
 	MethodOpenSession   = "open_session"
 	MethodCloseSession  = "close_session"
+	MethodSessionsList  = "sessions.list"
 	MethodBrowse        = "browse"
 	MethodCaptureList   = "capture.list"
 	MethodCaptureGet    = "capture.get"
@@ -241,6 +242,26 @@ type OpenSessionResult struct {
 	ExpiresAt time.Time `json:"expires_at"`
 	Seed      string    `json:"seed"`
 	NewToken  string    `json:"new_token,omitempty"`
+}
+
+// SessionsListParams: sessions.list lists the caller's open browser sessions.
+type SessionsListParams struct {
+	Caller
+}
+
+// SessionInfo describes one open browser session.
+type SessionInfo struct {
+	SessionID string    `json:"session_id"`
+	Policies  []string  `json:"policies"`
+	Seed      string    `json:"seed"`
+	Write     bool      `json:"write,omitempty"`
+	Explore   bool      `json:"explore,omitempty"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// SessionsListResult lists the caller's sessions, oldest first.
+type SessionsListResult struct {
+	Sessions []SessionInfo `json:"sessions"`
 }
 
 // CloseSessionParams: close_session(token, session_id). Empty SessionID

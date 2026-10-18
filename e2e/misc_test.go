@@ -245,11 +245,10 @@ func TestDaemonStop(t *testing.T) {
 
 func TestBrowserCommandsExist(t *testing.T) {
 	e := newEnv(t)
-	// Until the browser is wired these answer not_available; once wired they
-	// need a real session. Either way they must not crash and must not claim
-	// to be unknown commands.
+	// Without a session they must fail cleanly (never launch a browser here)
+	// and must not claim to be unknown commands.
 	for _, args := range [][]string{
-		{"session", "open", "app"}, {"browse", "open", e.base() + "/"}, {"browse", "capture", "list"},
+		{"--no-prompt", "session", "open", "app"}, {"browse", "open", e.base() + "/"}, {"browse", "capture", "list"},
 		{"distill", "draft", "x", "c1"}, {"session", "close"},
 	} {
 		r := e.curd(args...)
