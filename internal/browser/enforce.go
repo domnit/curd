@@ -173,6 +173,14 @@ func (s *Session) decide(ctx context.Context, sid string, p *pausedRequest) verd
 		return verdict{allow: true}
 	}
 
+	if isDoc && s.inLoginPhase() {
+		// A login form submission is a top-level POST to a policy host.
+		// In a login-seeded session nothing was hoisted, so the only
+		// credentials involved are the ones being typed into the form.
+		// Fetch/XHR writes stay blocked; the allowance is audited.
+		s.emit(SessionEvent{Type: "login_post", Method: method, URL: u.String(), Host: host})
+		return verdict{allow: true}
+	}
 	body := s.requestBody(ctx, sid, p)
 	var first *policy.Decision
 	for _, pol := range pols {
@@ -248,4 +256,21 @@ func (s *Session) requestBody(ctx context.Context, sid string, p *pausedRequest)
 		}
 	}
 	return nil
+}
+
+// LoginPhase is how long a login-seeded session lets form submissions
+// (Document POSTs) to policy hosts through without a write grant, so the user
+// can sign in. `browse login done` ends it early.
+const LoginPhase = 10 * time.Minute
+
+func (s *Session) inLoginPhase() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.loginUntil.IsZero() && s.opts.Now().Before(s.loginUntil)
+}
+
+func (s *Session) endLoginPhase() {
+	s.mu.Lock()
+	s.loginUntil = time.Time{}
+	s.mu.Unlock()
 }

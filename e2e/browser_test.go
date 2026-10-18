@@ -14,8 +14,9 @@ import (
 )
 
 // loginPolicy covers the mock app for interactive login: no cookies are ever
-// hoisted from the fixture (so the default seed is "login"), and the login
-// form's POST is a write rule, so the session needs write access.
+// hoisted from the fixture (so the default seed is "login"). The policy has
+// no write rule: the login form's POST goes through only during the
+// session's login phase.
 const loginPolicy = `
 name: applogin
 match:
@@ -25,9 +26,6 @@ credentials:
 allow:
   - methods: [GET]
     paths: ['^/.*$']
-  - methods: [POST]
-    scope: write
-    paths: ['^/login$']
 test:
   host_map: {app.example.com: 127.0.0.1}
 `
@@ -333,7 +331,7 @@ allow:
 	t.Run("interactive login", func(t *testing.T) {
 		e.resetMock()
 		// No hoistable credentials for this policy: the default seed is login.
-		r := e.bcurd("session", "open", "applogin", "--write", "--login-url", e.base()+"/login")
+		r := e.bcurd("session", "open", "applogin", "--login-url", e.base()+"/login")
 		wantCode(t, r, 0)
 		wantContains(t, "open", r.stdout, "seed login")
 		wantContains(t, "open", r.stderr, "browse type")
@@ -356,6 +354,25 @@ allow:
 		rs := e.seen("app.example.com", "/login")
 		if len(rs) == 0 || rs[0].Cookies["session"] != "" {
 			t.Fatalf("login page request carried a session cookie: %+v", rs)
+		}
+		posts := func() (n int) {
+			for _, r := range e.seen("app.example.com", "/login") {
+				if r.Method == "POST" {
+					n++
+				}
+			}
+			return n
+		}
+		if posts() != 1 {
+			t.Fatalf("login POST during the login phase: saw %d", posts())
+		}
+		// Once the login phase ends the session is read-only again.
+		wantContains(t, "login done", e.browse("login", "done").stdout, "login phase: closed")
+		wantCode(t, e.browse("open", e.base()+"/login"), 0)
+		e.browse("click", "#login-button")
+		e.browse("waitidle")
+		if posts() != 1 {
+			t.Fatalf("form POST went through after `login done`: saw %d", posts())
 		}
 	})
 

@@ -43,7 +43,10 @@ type Session struct {
 	unsub  func()
 
 	startURL string
-	lsScript string
+	// loginUntil ends the login phase of a login-seeded session (see
+	// inLoginPhase); zero when there is none.
+	loginUntil time.Time
+	lsScript   string
 
 	verbMu sync.Mutex
 
@@ -206,6 +209,7 @@ func (s *Session) start(ctx context.Context) error {
 			return err
 		}
 		s.startURL = u
+		s.loginUntil = s.opts.Now().Add(LoginPhase)
 	}
 
 	args := []string{"--disable-features=BackForwardCache", "--disable-extensions"}

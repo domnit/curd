@@ -126,8 +126,18 @@ verbs and never get raw browser access or credentials.
   curd browse open <url> | back | forward | reload | url | title
   curd browse text <selector> | html <selector> | exists <selector> | visible <selector>
   curd browse click <selector> | type <selector> <text> | focus <selector>
-  curd browse waitstable | waitidle | screenshot [-o page.png] | pages | newpage | closepage
+  curd browse waitstable | waitidle | screenshot [-o page.png] | pages | newpage | closepage | page <n>
   curd session close
+
+  Two ways to log the browser in:
+  - hoist (default when the Chrome profile has credentials for the policy):
+    cookies and localStorage are copied into the browser's in-memory context.
+  - login (--login, preferred when a human is present): the browser starts
+    logged out and the user signs in in the window. For 10 minutes (or until
+    "curd browse login done") login form submissions are allowed without a
+    write grant; fetch/XHR writes stay blocked. "curd browse login" shows the
+    state. Interactive-login sessions suit browse-verb automation, not
+    distilling a curd fetch script (that needs the login in the Chrome profile).
 
   - Navigation outside the session's policy hosts is blocked. Requests the
     page makes follow the same method/path rules as the policy.
@@ -138,8 +148,6 @@ verbs and never get raw browser access or credentials.
     such as {cookie:session}.
   - The js verb (arbitrary JavaScript) is not available by default because it
     could read cookies; prefer the structured verbs.
-  - If a command reports not_available, that part of curd is not enabled in
-    this build; use curd fetch.
 
 7. THE LOOP: explore -> capture -> distill -> verify -> approve
 ----------------------------------------------------------------

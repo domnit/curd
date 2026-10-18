@@ -47,7 +47,7 @@ var verbList = []verbInfo{
 	{"newpage", "newpage [url]", "open a new page and make it active"},
 	{"closepage", "closepage [index]", "close a page (default: the active one)"},
 	{"page", "page <index>", "make a page active"},
-	{"login", "login", "show login state and instructions (login-mode sessions)"},
+	{"login", "login [done]", "show login state and instructions; `login done` ends the login phase (login-mode sessions)"},
 	{"capture", "capture <subcommand>", "use `curd browse capture ...` (handled by the daemon)"},
 	{"help", "help", "list the verbs"},
 }
@@ -267,6 +267,13 @@ func (s *Session) dispatch(ctx context.Context, verb string, args []string) (*ap
 		}
 		return s.vSwitchPage(ctx, args[0])
 	case "login":
+		switch {
+		case len(args) == 0:
+		case len(args) == 1 && args[0] == "done":
+			s.endLoginPhase()
+		default:
+			return nil, usage(verb)
+		}
 		return s.vLogin(ctx)
 	}
 	return nil, apierr.Newf(apierr.InvalidRequest, "verbs: "+verbNames(), "unknown browse verb %q", verb)
@@ -464,6 +471,12 @@ func (s *Session) vLogin(ctx context.Context) (*api.BrowseResult, error) {
 		fmt.Fprintf(&b, "interactive login session (nothing was seeded)\nlogin page: %s\n", s.startURL)
 		b.WriteString("sign in in the browser window, then continue with `url`, `title`, `text <selector>`.\n")
 		b.WriteString("a human must complete any password, 2FA or captcha step; curd does not see or store what they type.\n")
+		if s.inLoginPhase() {
+			b.WriteString("login phase: open; form submissions to policy hosts are allowed so the user can sign in.\n")
+			b.WriteString("run `login done` once signed in (it also ends by itself after 10 minutes); after that the session is read-only unless opened with --write.\n")
+		} else {
+			b.WriteString("login phase: closed; writes need a session opened with --write.\n")
+		}
 	} else {
 		b.WriteString("credential-seeded session: logged in from the credential sources; no interactive login is needed.\n")
 	}

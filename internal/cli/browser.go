@@ -44,8 +44,10 @@ use your most recent session unless you pass --session <id>.
                context (the default when the profile has any for the policies)
   --login      start logged out and sign in through the browser yourself:
                "curd browse open <login url>", "curd browse type <sel> <text>",
-               "curd browse click <sel>". Nothing is copied. The default when
-               the profile holds nothing for the policies
+               "curd browse click <sel>". Nothing is copied. Login form
+               posts are allowed for 10 minutes (or until "curd browse login
+               done") without a write grant. The default when the profile
+               holds nothing for the policies
   --login-url  first page for --login (default: https://<first policy host>/)
   --explore    tag the audit records "explore" (the session is for capturing
                a site's API)
@@ -178,6 +180,8 @@ var browseVerbs = []verbSpec{
 	{"pages", "List open pages", "List the pages (tabs) of the session with their index, URL and title.", 0, 0, false},
 	{"newpage [url]", "Open a new page", "Open a new page in the session's browser context, optionally navigating to a URL.", 0, 1, false},
 	{"closepage [index]", "Close a page", "Close the page with the given index (see \"pages\"), default the current one.", 0, 1, false},
+	{"page <index>", "Switch to another page", "Make the page with the given index (see \"pages\") the current one.", 1, 1, false},
+	{"login [done]", "Show interactive-login state; \"login done\" ends the login phase", "In a session opened with --login, form submissions (Document POSTs) to policy hosts are allowed for 10 minutes so the user can sign in, without a write grant; fetch/XHR writes stay blocked. Run \"login done\" once signed in to end that phase early; afterwards the session is read-only unless it was opened with --write.", 0, 1, false},
 	{"js <expression>", "Evaluate JavaScript (gated: not available by default)", "Arbitrary JavaScript could read cookies and localStorage, so this verb is gated: it needs an explicit js grant, is refused on any origin that has credentials loaded, and every evaluation is audited. Prefer the structured verbs.", 1, -1, false},
 }
 
@@ -194,7 +198,8 @@ cookies or storage, and everything returned is redacted.
   text <sel>  html <sel>  exists <sel>  visible <sel>
   click <sel>  type <sel> <text>  focus <sel>
   waitstable  waitidle  screenshot [-o file.png]
-  pages  newpage [url]  closepage [index]
+  pages  newpage [url]  closepage [index]  page <index>
+  login [done]
   capture list|get|find-source|export     read the recorded network traffic
 
 Selectors are CSS selectors. Navigation outside the session's policy hosts is
