@@ -71,8 +71,12 @@ type FetchResult struct {
 	Body      []byte   `json:"body"`
 	Truncated bool     `json:"truncated"`
 	URL       string   `json:"url"` // final URL after allowed redirects
-	Policy    string   `json:"policy"`
-	GrantID   string   `json:"grant_id"`
+	// RedirectBlocked is set when an upstream redirect was not followed
+	// because the policy forbids it; the 3xx response is returned as is.
+	RedirectBlocked string `json:"redirect_blocked,omitempty"`
+	Retried         bool   `json:"retried,omitempty"` // credentials reloaded after 401/403
+	Policy          string `json:"policy"`
+	GrantID         string `json:"grant_id"`
 	// NewToken is set when this call ran consent and minted a grant.
 	NewToken string   `json:"new_token,omitempty"`
 	Explain  *Explain `json:"explain,omitempty"`
